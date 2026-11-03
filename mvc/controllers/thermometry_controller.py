@@ -118,15 +118,21 @@ class ThermometryController:
             return False
 
         self.view.update_status("Applying motion correction...")
-        result = self.registrar.register_complex(
-            fixed_real=self.model.real1,
-            fixed_imag=self.model.imag1,
-            moving_real=self.model.real2,
-            moving_imag=self.model.imag2,
-            config=self.registration_config,
-        )
+        try:
+            result = self.registrar.register_complex(
+                fixed_real=self.model.real1,
+                fixed_imag=self.model.imag1,
+                moving_real=self.model.real2,
+                moving_imag=self.model.imag2,
+                config=self.registration_config,
+            )
+        except Exception as exc:  # e.g. shape mismatch; keep the UI responsive
+            self.model.registration_result = None
+            self.view.show_error(f"Error in motion correction: {exc}")
+            return False
 
         if result.status == "failed":
+            self.model.registration_result = None
             self.view.show_error(f"Error in motion correction: {result.message}")
             return False
 

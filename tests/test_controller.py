@@ -137,6 +137,46 @@ def test_apply_motion_correction_reports_failure():
     assert any("boom" in item for item in view.errors)
 
 
+def test_failed_registration_clears_a_stale_correction():
+    failure = RegistrationResult(
+        warped_real=None,
+        warped_imag=None,
+        transform=None,
+        config=RegistrationConfig(),
+        metric_name="MattesMutualInformation",
+        final_metric=float("nan"),
+        dice=float("nan"),
+        iterations=0,
+        stop_condition="",
+        elapsed_s=0.0,
+        status="failed",
+        message="boom",
+    )
+    controller, model, _, _ = _controller(failure)
+    model.registration_result = object()
+
+    assert controller.apply_motion_correction() is False
+    assert model.registration_result is None
+
+
+def test_registrar_exception_is_handled():
+    class RaisingRegistrar:
+        def register_complex(self, **kwargs):
+            raise ValueError("bad shapes")
+
+    model = FakeModel()
+    view = FakeView()
+    controller = ThermometryController.__new__(ThermometryController)
+    controller.model = model
+    controller.view = view
+    controller.registrar = RaisingRegistrar()
+    controller.registration_config = RegistrationConfig()
+
+    assert controller.apply_motion_correction() is False
+    assert any("bad shapes" in item for item in view.errors)
+    assert model.registration_result is None
+
+
 def test_calculate_temperature_uses_registration_when_it_succeeds():
     controller, model, view, _ = _controller(_result())
 
