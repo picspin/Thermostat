@@ -1,15 +1,26 @@
 import os
 import numpy as np
-import SimpleITK as sitk
+from mvc.models.registration import RegistrationConfig, SimpleITKRegistrar
 import pydicom
 from datetime import datetime
 import csv
 
 class ThermometryController:
-    def __init__(self, model, view):
-        """Initialize the controller with model and view references."""
+    def __init__(self, model, view, registrar=None, registration_config=None):
+        """Initialize the controller with model and view references.
+
+        ``registrar`` and ``registration_config`` are optional injection points
+        for tests; production code uses the SimpleITK registrar with the
+        historical default configuration.
+        """
         self.model = model
         self.view = view
+        self.registrar = registrar if registrar is not None else SimpleITKRegistrar()
+        self.registration_config = (
+            registration_config
+            if registration_config is not None
+            else RegistrationConfig()
+        )
         
         # Connect view signals to controller methods
         self.connect_signals()
@@ -95,103 +106,40 @@ class ThermometryController:
             self.view.show_error("Failed to load B0 map DICOM file")
         
     def apply_motion_correction(self):
-        """Apply motion correction using elastic registration."""
-        try:
-            # Check if we have the necessary images
-            if self.model.real1 is None or self.model.real2 is None:
-                self.view.show_error("Missing required images for motion correction")
-                return False
-                
-            self.view.update_status("Applying motion correction...")
-            
-            # Convert numpy arrays to SimpleITK images
-            fixed_image = sitk.GetImageFromArray(self.model.real1)
-            moving_image = sitk.GetImageFromArray(self.model.real2)
-            
-            # Set up registration method
-            registration_method = sitk.ImageRegistrationMethod()
-            
-            # Set similarity metric - Mutual Information works well for inter-modal registration
-            registration_method.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
-            registration_method.SetMetricSamplingStrategy(registration_method.RANDOM)
-            registration_method.SetMetricSamplingPercentage(0.1)
-            
-            # Set optimizer - Gradient Descent
-            registration_method.SetOptimizerAsGradientDescent(
-                learningRate=1.0, 
-                numberOfIterations=100, 
-                convergenceMinimumValue=1e-6, 
-                convergenceWindowSize=10
-            )
-            registration_method.SetOptimizerScalesFromPhysicalShift()
-            
-            # Setup for the multi-resolution framework
-            registration_method.SetShrinkFactorsPerLevel(shrinkFactors=[4, 2, 1])
-            registration_method.SetSmoothingSigmasPerLevel(smoothingSigmas=[2, 1, 0])
-            registration_method.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
-            
-            # Set the interpolator
-            registration_method.SetInterpolator(sitk.sitkLinear)
-            
-            # Set the transform - BSpline for elastic registration
-            transform_domain_mesh_size = [8] * fixed_image.GetDimension()
-            transform = sitk.BSplineTransformInitializer(
-                fixed_image, 
-                transform_domain_mesh_size
-            )
-            registration_method.SetInitialTransform(transform)
-            
-            # Execute registration
-            final_transform = registration_method.Execute(fixed_image, moving_image)
-            
-            # Apply transform to real2 and imag2
-            real2_registered = sitk.GetArrayFromImage(
-                sitk.Resample(
-                    moving_image, 
-                    fixed_image, 
-                    final_transform, 
-                    sitk.sitkLinear, 
-                    0.0, 
-                    moving_image.GetPixelID()
-                )
-            )
-            
-            # Apply same transform to imaginary component
-            if self.model.imag2 is not None:
-                moving_imag = sitk.GetImageFromArray(self.model.imag2)
-                imag2_registered = sitk.GetArrayFromImage(
-                    sitk.Resample(
-                        moving_imag, 
-                        fixed_image, 
-                        final_transform, 
-                        sitk.sitkLinear, 
-                        0.0, 
-                        moving_imag.GetPixelID()
-                    )
-                )
-                self.model.imag2 = imag2_registered
-            
-            # Update the model with registered images
-            self.model.real2 = real2_registered
-            
-            # Calculate DICE coefficient to evaluate registration quality
-            fixed_binary = sitk.BinaryThreshold(fixed_image, lowerThreshold=np.mean(self.model.real1), upperThreshold=np.max(self.model.real1))
-            moving_binary = sitk.BinaryThreshold(sitk.GetImageFromArray(real2_registered), lowerThreshold=np.mean(real2_registered), upperThreshold=np.max(real2_registered))
-            
-            overlap_measures_filter = sitk.LabelOverlapMeasuresImageFilter()
-            overlap_measures_filter.Execute(fixed_binary, moving_binary)
-            dice_coefficient = overlap_measures_filter.GetDiceCoefficient()
-            
-            self.view.update_status(f"Motion correction applied - DICE coefficient: {dice_coefficient:.3f}")
-            
-            if dice_coefficient < 0.9:
-                self.view.update_status("Warning: Registration quality may be insufficient (DICE < 0.9)")
-                
-            return True
-            
-        except Exception as e:
-            self.view.show_error(f"Error in motion correction: {str(e)}")
+        """Apply motion correction using elastic registration.
+
+        The registration itself lives in ``mvc.models.registration``.  The
+        corrected copy is stored on the model; the acquired ``real2/imag2``
+        arrays are never overwritten, so repeated calls and toggling the
+        checkbox are non-destructive.
+        """
+        if self.model.real1 is None or self.model.real2 is None:
+            self.view.show_error("Missing required images for motion correction")
             return False
+
+        self.view.update_status("Applying motion correction...")
+        result = self.registrar.register_complex(
+            fixed_real=self.model.real1,
+            fixed_imag=self.model.imag1,
+            moving_real=self.model.real2,
+            moving_imag=self.model.imag2,
+            config=self.registration_config,
+        )
+
+        if result.status == "failed":
+            self.view.show_error(f"Error in motion correction: {result.message}")
+            return False
+
+        self.model.registration_result = result
+        self.view.update_status(
+            f"Motion correction applied - DICE coefficient: {result.dice:.3f}"
+        )
+        if result.status == "warning":
+            self.view.update_status(
+                "Warning: Registration quality may be insufficient "
+                f"(DICE < {self.registration_config.dice_warning_threshold})"
+            )
+        return True
         
     def calculate_temperature(self, original_temperature, apply_gaussian, apply_b0_correction, apply_motion_correction):
         """Handle temperature calculation request."""
@@ -200,17 +148,23 @@ class ThermometryController:
             self.view.show_error("Missing required DICOM data. Please load all required DICOM files.")
             return
             
-        # Apply motion correction if requested
+        # Apply motion correction if requested.  A failed correction is
+        # reported but the temperature calculation continues on the original
+        # images (the historical fallback behavior).
+        use_registration = False
         if apply_motion_correction:
             success = self.apply_motion_correction()
             if not success:
                 self.view.show_error("Motion correction failed. Proceeding without it.")
+            else:
+                use_registration = True
         
         # Calculate temperature
         success = self.model.calculate_temperature(
             original_temperature=original_temperature,
             apply_gaussian_filter=apply_gaussian,
-            apply_b0_correction=apply_b0_correction
+            apply_b0_correction=apply_b0_correction,
+            use_registration=use_registration,
         )
         
         if success:

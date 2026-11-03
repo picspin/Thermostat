@@ -34,10 +34,17 @@ class ThermometryModel(QObject):
         self.alpha = -0.01  # ppm/°C, PRF temperature sensitivity coefficient
         self.roi_points = None  # Store ROI points
         self.roi_name = None    # Store ROI name
+        # Corrected copy of the second time point (see mvc.models.registration).
+        # The acquired real2/imag2 arrays are kept intact.
+        self.registration_result = None
         
         # 创建ROI保存目录
         self.roi_save_dir = os.path.join(os.path.expanduser("~"), ".mr_thermometry", "rois")
         os.makedirs(self.roi_save_dir, exist_ok=True)
+
+    def _invalidate_registration(self):
+        """Drop a correction that no longer matches the loaded images."""
+        self.registration_result = None
 
     def _extract_dicom_parameters(self, ds):
         """Extract relevant parameters from DICOM header.
@@ -123,6 +130,7 @@ class ThermometryModel(QObject):
         try:
             ds = pydicom.dcmread(file_path)
             self.real1 = ds.pixel_array.astype(float)
+            self._invalidate_registration()
             self._extract_dicom_parameters(ds)
             self._update_header_info(ds, "Real 1")
             return True
@@ -135,6 +143,7 @@ class ThermometryModel(QObject):
         try:
             ds = pydicom.dcmread(file_path)
             self.imag1 = ds.pixel_array.astype(float)
+            self._invalidate_registration()
             self._extract_dicom_parameters(ds)
             self._update_header_info(ds, "Imaginary 1")
             return True
@@ -147,6 +156,7 @@ class ThermometryModel(QObject):
         try:
             ds = pydicom.dcmread(file_path)
             self.real2 = ds.pixel_array.astype(float)
+            self._invalidate_registration()
             self._extract_dicom_parameters(ds)
             self._update_header_info(ds, "Real 2")
             return True
@@ -159,6 +169,7 @@ class ThermometryModel(QObject):
         try:
             ds = pydicom.dcmread(file_path)
             self.imag2 = ds.pixel_array.astype(float)
+            self._invalidate_registration()
             self._extract_dicom_parameters(ds)
             self._update_header_info(ds, "Imaginary 2")
             return True
@@ -177,96 +188,7 @@ class ThermometryModel(QObject):
             print(f"Error loading B0 Map DICOM: {e}")
             return False
 
-    # def calculate_temperature(self, original_temperature, apply_gaussian_filter=False, apply_b0_correction=False, apply_motion_correction=False, sigma=1.0):
-    #     """Calculate temperature changes using PRF thermometry."""
-    #     if self.real1 is None or self.imag1 is None or self.real2 is None or self.imag2 is None:
-    #         self.error_occurred.emit("Missing required DICOM data")
-    #         return False
-        
-    #     if self.te is None or self.b0 is None:
-    #         self.error_occurred.emit("Missing required DICOM parameters (TE or B0)")
-    #         return False
-
-    #     try:
-    #         # Apply motion correction if requested
-    #         if apply_motion_correction:
-    #             print("Applying motion correction...")
-    #             # Correct real and imaginary parts separately
-    #             self.real2 = self.apply_motion_correction(self.real2, self.real1)
-    #             self.imag2 = self.apply_motion_correction(self.imag2, self.imag1)
-            
-    #         # Normalize complex data
-    #         complex1 = self.real1 + 1j * self.imag1
-    #         complex2 = self.real2 + 1j * self.imag2
-            
-    #         # Calculate magnitude for normalization
-    #         magnitude1 = np.abs(complex1)
-    #         magnitude2 = np.abs(complex2)
-            
-    #         # Normalize complex data to reduce noise
-    #         complex1_norm = complex1 / (magnitude1 + np.finfo(float).eps)
-    #         complex2_norm = complex2 / (magnitude2 + np.finfo(float).eps)
-            
-    #         # Calculate phase difference
-    #         self.phase_diff = np.angle(complex2_norm * np.conj(complex1_norm))
-            
-    #         # Apply Gaussian filter if requested (optimized for noise reduction)
-    #         if apply_gaussian_filter:
-    #             # Use adaptive sigma based on noise level
-    #             noise_level = np.std(self.phase_diff)
-    #             adaptive_sigma = sigma * (1 + noise_level)
-    #             self.phase_diff = gaussian(self.phase_diff, sigma=adaptive_sigma, preserve_range=True)
-            
-    #         # Apply B0 correction if requested and available
-    #         if apply_b0_correction and self.dem_b0_map is not None:
-    #             if self.dem_b0_map.shape != self.phase_diff.shape:
-    #                 print(f"Resizing B0 map from {self.dem_b0_map.shape} to {self.phase_diff.shape}")
-    #                 zoom_factors = (self.phase_diff.shape[0] / self.dem_b0_map.shape[0], 
-    #                               self.phase_diff.shape[1] / self.dem_b0_map.shape[1])
-    #                 # Use cubic interpolation for better accuracy
-    #                 resized_b0_map = zoom(self.dem_b0_map, zoom_factors, order=3)
-                    
-    #                 # Calculate normalization factor based on phase difference statistics
-    #                 # This helps align the B0 map scale with the phase difference scale
-    #                 phase_diff_range = np.percentile(self.phase_diff, 95) - np.percentile(self.phase_diff, 5)
-    #                 b0_range = np.percentile(resized_b0_map, 95) - np.percentile(resized_b0_map, 5)
-    #                 norm_factor = phase_diff_range / (b0_range + np.finfo(float).eps)
-                    
-    #                 # Apply normalized B0 correction
-    #                 self.phase_diff -= resized_b0_map * norm_factor
-    #             else:
-    #                 # Calculate normalization factor based on phase difference statistics
-    #                 phase_diff_range = np.percentile(self.phase_diff, 95) - np.percentile(self.phase_diff, 5)
-    #                 b0_range = np.percentile(self.dem_b0_map, 95) - np.percentile(self.dem_b0_map, 5)
-    #                 norm_factor = phase_diff_range / (b0_range + np.finfo(float).eps)
-                    
-    #                 # Apply normalized B0 correction
-    #                 self.phase_diff -= self.dem_b0_map * norm_factor
-            
-    #         # Convert units for temperature calculation
-    #         te_seconds = self.te / 1000.0  # Convert ms to s
-    #         gamma_hz_per_tesla = self.gyromagnetic_ratio * 1e6  # Convert MHz/T to Hz/T
-    #         alpha_per_celsius = self.alpha * 1e-6  # Convert ppm/°C to 1/°C
-            
-    #         # Calculate temperature change
-    #         # ΔT = Δφ / (2π * γ * α * B0 * TE)
-    #         denominator = 2 * np.pi * gamma_hz_per_tesla * abs(alpha_per_celsius) * self.b0 * te_seconds
-    #         self.temperature_change = self.phase_diff / denominator
-            
-    #         # Calculate absolute temperature from temperature change (add baseline)
-    #         self.temperature_map = original_temperature + self.temperature_change
-            
-    #         # Emit signal to notify view
-    #         self.temperature_updated.emit(self.temperature_map)
-            
-    #         return True
-    #     except Exception as e:
-    #         error_msg = f"Error calculating temperature: {e}"
-    #         print(error_msg)
-    #         self.error_occurred.emit(error_msg)
-    #         return False 
-    
-    def calculate_temperature(self, original_temperature, apply_gaussian_filter=False, apply_b0_correction=False, apply_motion_correction=False, sigma=1.0):
+    def calculate_temperature(self, original_temperature, apply_gaussian_filter=False, apply_b0_correction=False, use_registration=False, sigma=1.0):
         """Calculate temperature changes using PRF thermometry with improved filtering."""
         if self.real1 is None or self.imag1 is None or self.real2 is None or self.imag2 is None:
             self.error_occurred.emit("Missing required DICOM data")
@@ -277,16 +199,19 @@ class ThermometryModel(QObject):
             return False
 
         try:
-            # Apply motion correction if requested
-            if apply_motion_correction:
-                print("Applying motion correction...")
-                # Correct real and imaginary parts separately
-                self.real2 = self.apply_motion_correction(self.real2, self.real1)
-                self.imag2 = self.apply_motion_correction(self.imag2, self.imag1)
-            
+            # Use the registered copy when requested; the acquired originals
+            # are never overwritten by motion correction.
+            real2 = self.real2
+            imag2 = self.imag2
+            if (use_registration and self.registration_result is not None
+                    and self.registration_result.warped_real is not None):
+                real2 = self.registration_result.warped_real
+                if self.registration_result.warped_imag is not None:
+                    imag2 = self.registration_result.warped_imag
+
             # Normalize complex data
             complex1 = self.real1 + 1j * self.imag1
-            complex2 = self.real2 + 1j * self.imag2
+            complex2 = real2 + 1j * imag2
             
             # Calculate magnitude for normalization
             magnitude1 = np.abs(complex1)
@@ -423,6 +348,7 @@ class ThermometryModel(QObject):
         self.imag1 = None
         self.real2 = None
         self.imag2 = None
+        self.registration_result = None
         self.dem_b0_map = None
         self.temperature_change = None
         self.temperature_map = None
@@ -501,89 +427,6 @@ class ThermometryModel(QObject):
             self.error_occurred.emit(f"Error getting saved ROI names: {str(e)}")
             return []
 
-    def apply_motion_correction(self, moving_image, fixed_image):
-        """Apply B-spline registration for motion correction.
-        
-        Uses free-form deformation model with B-spline interpolation.
-        """
-        try:
-            from scipy.interpolate import RegularGridInterpolator
-            import numpy as np
-            
-            # Create control point grid (coarse grid for B-spline control points)
-            grid_spacing = 10  # Control point spacing
-            y = np.arange(0, moving_image.shape[0], grid_spacing)
-            x = np.arange(0, moving_image.shape[1], grid_spacing)
-            
-            # Initialize displacement fields
-            dx = np.zeros((len(y), len(x)))
-            dy = np.zeros((len(y), len(x)))
-            
-            # Create full resolution grid
-            y_full = np.arange(moving_image.shape[0])
-            x_full = np.arange(moving_image.shape[1])
-            X_full, Y_full = np.meshgrid(x_full, y_full)
-            
-            # Optimization parameters
-            max_iter = 100
-            learning_rate = 0.1
-            convergence_threshold = 1e-6
-            
-            # Iterative optimization
-            prev_error = float('inf')
-            for iteration in range(max_iter):
-                # Interpolate displacement fields to full resolution
-                dx_interpolator = RegularGridInterpolator((y, x), dx, bounds_error=False, fill_value=0)
-                dy_interpolator = RegularGridInterpolator((y, x), dy, bounds_error=False, fill_value=0)
-                
-                # Get full resolution displacement fields
-                points = np.column_stack((Y_full.flatten(), X_full.flatten()))
-                dx_full = dx_interpolator(points).reshape(moving_image.shape)
-                dy_full = dy_interpolator(points).reshape(moving_image.shape)
-                
-                # Apply deformation
-                warped_y = Y_full + dy_full
-                warped_x = X_full + dx_full
-                
-                # Interpolate moving image at new positions
-                valid_mask = (warped_y >= 0) & (warped_y < moving_image.shape[0]) & \
-                           (warped_x >= 0) & (warped_x < moving_image.shape[1])
-                
-                warped_image = np.zeros_like(moving_image)
-                points = np.column_stack((warped_y[valid_mask], warped_x[valid_mask]))
-                coords = np.column_stack((Y_full[valid_mask], X_full[valid_mask]))
-                
-                # Create interpolator for moving image
-                moving_interpolator = RegularGridInterpolator(
-                    (np.arange(moving_image.shape[0]), np.arange(moving_image.shape[1])),
-                    moving_image, bounds_error=False, fill_value=0)
-                
-                # Apply interpolation
-                warped_image[valid_mask] = moving_interpolator(points)
-                
-                # Calculate error
-                error = np.mean((warped_image - fixed_image) ** 2)
-                
-                # Check convergence
-                if abs(error - prev_error) < convergence_threshold:
-                    break
-                
-                # Update displacement fields
-                error_gradient = 2 * (warped_image - fixed_image)
-                dx -= learning_rate * np.mean(error_gradient[valid_mask] * 
-                                           (moving_image[1:, :] - moving_image[:-1, :]))
-                dy -= learning_rate * np.mean(error_gradient[valid_mask] * 
-                                           (moving_image[:, 1:] - moving_image[:, :-1]))
-                
-                prev_error = error
-            
-            return warped_image
-            
-        except Exception as e:
-            error_msg = f"Error in motion correction: {e}"
-            print(error_msg)
-            self.error_occurred.emit(error_msg)
-            return moving_image  # Return original image if correction fails
     def _apply_advanced_gaussian_filter(self, phase_diff, mask, sigma=1.0):
         """Apply multi-scale Gaussian filtering with edge preservation."""
         try:
