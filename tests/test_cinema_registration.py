@@ -7,7 +7,8 @@ from mvc.models.registration import RegistrationConfig, RegistrationResult
 
 
 class RecordingModel:
-    def __init__(self):
+    def __init__(self, fail_loads=()):
+        self.fail_loads = set(fail_loads)
         self.loads = []
         self.real1 = np.ones((4, 4))
         self.imag1 = np.zeros((4, 4))
@@ -17,23 +18,26 @@ class RecordingModel:
         self.registration_result = None
         self.calls = []
 
-    def load_real1_dicom(self, path):
-        self.loads.append(("real1", path))
+    def _load(self, name, path):
+        self.loads.append((name, path))
+        self.registration_result = None
+        if (name, path) in self.fail_loads:
+            return False
+        # A new array each time, so a later frame cannot alias an earlier one.
+        setattr(self, name, np.full((4, 4), float(len(self.loads))))
         return True
+
+    def load_real1_dicom(self, path):
+        return self._load("real1", path)
 
     def load_imag1_dicom(self, path):
-        self.loads.append(("imag1", path))
-        return True
+        return self._load("imag1", path)
 
     def load_real2_dicom(self, path):
-        self.loads.append(("real2", path))
-        self.registration_result = None
-        return True
+        return self._load("real2", path)
 
     def load_imag2_dicom(self, path):
-        self.loads.append(("imag2", path))
-        self.registration_result = None
-        return True
+        return self._load("imag2", path)
 
     def calculate_temperature(self, **kwargs):
         self.calls.append(kwargs)
@@ -134,8 +138,18 @@ def test_sequence_registers_every_later_frame_to_the_baseline():
     assert len(sequence) == 2
     assert all(frame is not None for frame in sequence)
     assert [item for item in model.loads if item[0] == "real1"] == [("real1", "r0")]
+    assert [item for item in model.loads if item[0] == "real2"] == [
+        ("real2", "r1"),
+        ("real2", "r2"),
+    ]
+    assert [item for item in model.loads if item[0] == "imag2"] == [
+        ("imag2", "i1"),
+        ("imag2", "i2"),
+    ]
     moving = [call["moving_real"] for call in registrar.calls]
-    assert moving == [model.real2, model.real2]
+    assert len(moving) == 2
+    assert moving[0] is not moving[1]
+    assert not np.array_equal(moving[0], moving[1])
     assert all(call["fixed_real"] is model.real1 for call in registrar.calls)
     assert all(call["use_registration"] is True for call in model.calls)
     assert registrar.calls[0]["config"].random_seed == 4
@@ -157,6 +171,41 @@ def test_a_failed_frame_does_not_remove_the_frames_around_it():
     assert sequence[1] is not None
     assert any("frame failed" in message for message in cinema.errors)
     assert len(model.calls) == 1
+
+
+def test_a_failed_moving_load_is_skipped_instead_of_reusing_the_previous_frame():
+    model = RecordingModel(fail_loads={("real2", "r2")})
+    cinema = _cinema(model)
+    registrar = FrameRegistrar()
+
+    sequence = cinema.calculate_temperature_sequence(
+        ["r0", "r1", "r2"],
+        ["i0", "i1", "i2"],
+        apply_motion_correction=True,
+        registrar=registrar,
+    )
+
+    assert sequence[0] is not None
+    assert sequence[1] is None
+    assert len(registrar.calls) == 1
+    assert registrar.calls[0]["moving_real"] is model.real2
+    assert len(model.calls) == 1
+    assert any("Failed to load real frame 3" in message for message in cinema.errors)
+    assert ("imag2", "i2") not in model.loads
+
+
+def test_a_failed_fixed_load_without_registration_is_stored_as_none():
+    model = RecordingModel(fail_loads={("real1", "r1")})
+    cinema = _cinema(model)
+
+    sequence = cinema.calculate_temperature_sequence(
+        ["r0", "r1", "r2"], ["i0", "i1", "i2"]
+    )
+
+    assert sequence[0] is not None
+    assert sequence[1] is None
+    assert len(model.calls) == 1
+    assert any("Failed to load real frame 2" in message for message in cinema.errors)
 
 
 def test_motion_correction_without_a_registrar_is_refused():

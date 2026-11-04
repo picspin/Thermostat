@@ -33,8 +33,9 @@ class CinemaModel(QObject):
         When it is on, every later frame is registered to the first frame and
         the corrected copy is used for that pair only.  Consecutive-pair
         registration is intentionally not the default: its error would
-        accumulate along the sequence.  A failed frame is stored as ``None``
-        and does not change the earlier frames.
+        accumulate along the sequence.  A frame whose images fail to load, or
+        whose registration fails, is stored as ``None``.  The previous frame
+        is not reused, and earlier results are left unchanged.
         """
         if len(real_files) < 2 or len(imag_files) < 2:
             self.error_occurred.emit("Need at least 2 real and 2 imaginary files for sequence calculation")
@@ -71,13 +72,35 @@ class CinemaModel(QObject):
             
             try:
                 if not apply_motion_correction:
-                    self.thermometry_model.load_real1_dicom(real_files[fixed_index])
-                    self.thermometry_model.load_imag1_dicom(imag_files[fixed_index])
-                
+                    if not self._load_sequence_image(
+                        self.thermometry_model.load_real1_dicom,
+                        real_files[fixed_index],
+                        f"Failed to load real frame {fixed_index + 1}",
+                    ):
+                        continue
+                    if not self._load_sequence_image(
+                        self.thermometry_model.load_imag1_dicom,
+                        imag_files[fixed_index],
+                        f"Failed to load imaginary frame {fixed_index + 1}",
+                    ):
+                        continue
+
                 # Load the moving pair.  This also clears a correction that
-                # belonged to the previous frame.
-                self.thermometry_model.load_real2_dicom(real_files[moving_index])
-                self.thermometry_model.load_imag2_dicom(imag_files[moving_index])
+                # belonged to the previous frame.  A failed load leaves the
+                # previous arrays in place, so it must not fall through into
+                # registration or temperature calculation.
+                if not self._load_sequence_image(
+                    self.thermometry_model.load_real2_dicom,
+                    real_files[moving_index],
+                    f"Failed to load real frame {moving_index + 1}",
+                ):
+                    continue
+                if not self._load_sequence_image(
+                    self.thermometry_model.load_imag2_dicom,
+                    imag_files[moving_index],
+                    f"Failed to load imaginary frame {moving_index + 1}",
+                ):
+                    continue
 
                 use_registration = False
                 if apply_motion_correction:
@@ -120,6 +143,14 @@ class CinemaModel(QObject):
         # Emit completion signal with the sequence
         self.calculation_complete.emit(self.temperature_sequence)
         return self.temperature_sequence
+
+    def _load_sequence_image(self, load, path, message):
+        """Load one sequence image.  Failure records this frame as missing."""
+        if load(path):
+            return True
+        self.temperature_sequence.append(None)
+        self.error_occurred.emit(message)
+        return False
     
     def save_sequence_video(self, file_path, fps=2, vmin=None, vmax=None):
         """Save temperature sequence as a video file."""

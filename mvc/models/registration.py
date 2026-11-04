@@ -337,13 +337,22 @@ def _similarity_diagnostics(fixed, moving, warped, transform, reference_image):
 
 
 def _ncc(left, right):
+    """Pearson correlation.  A constant image makes it undefined.
+
+    Centering first would turn every constant image into zeros, so two
+    different constants would compare equal and incorrectly return 1.
+    """
     left = np.asarray(left, dtype=float).ravel()
     right = np.asarray(right, dtype=float).ravel()
+    if left.shape != right.shape or left.size == 0:
+        return float("nan")
+    if np.ptp(left) == 0.0 or np.ptp(right) == 0.0:
+        return float("nan")
     left = left - float(np.mean(left))
     right = right - float(np.mean(right))
     denom = float(np.linalg.norm(left) * np.linalg.norm(right))
     if denom == 0.0:
-        return 1.0 if np.allclose(left, right) else 0.0
+        return float("nan")
     return float(np.dot(left, right) / denom)
 
 
@@ -377,16 +386,27 @@ def _displacement_grid(transform, reference_image):
 def _magnitude_rms(field):
     if field is None:
         return float("nan")
-    values = sitk.GetArrayFromImage(field)
-    magnitude = np.linalg.norm(values, axis=-1)
-    return float(np.sqrt(np.mean(np.square(magnitude))))
+    try:
+        values = sitk.GetArrayFromImage(field)
+        magnitude = np.linalg.norm(values, axis=-1)
+        if magnitude.size == 0:
+            return float("nan")
+        return float(np.sqrt(np.mean(np.square(magnitude))))
+    except Exception:  # noqa: BLE001 - diagnostic only; registration already ran
+        return float("nan")
 
 
 def _magnitude_max(field):
     if field is None:
         return float("nan")
-    values = sitk.GetArrayFromImage(field)
-    return float(np.max(np.linalg.norm(values, axis=-1)))
+    try:
+        values = sitk.GetArrayFromImage(field)
+        magnitude = np.linalg.norm(values, axis=-1)
+        if magnitude.size == 0:
+            return float("nan")
+        return float(np.max(magnitude))
+    except Exception:  # noqa: BLE001 - diagnostic only; registration already ran
+        return float("nan")
 
 
 def _folding_ratio(field):
