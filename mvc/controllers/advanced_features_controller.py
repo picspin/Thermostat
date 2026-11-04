@@ -1,9 +1,11 @@
  # mvc/controllers/advanced_features_controller.py
 
 import os
+import threading
 import numpy as np
 from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QSlider, QLabel, QFileDialog, QProgressBar
 from PyQt5.QtCore import Qt, QTimer
+from mvc.controllers.background_work import BackgroundCall
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
@@ -25,6 +27,8 @@ class AdvancedFeaturesController:
         self.thermostat_model = thermostat_model
         self.registrar = registrar
         self.registration_config = registration_config
+        self._cinema_job = None
+        self._cinema_stop = None
         
         # Connect signals
         self.connect_signals()
@@ -63,10 +67,18 @@ class AdvancedFeaturesController:
             apply_b0_correction = self.view.b0_correction_checkbox.isChecked()
             apply_motion_correction = self.view.motion_correction_checkbox.isChecked()
             
-            # Create progress dialog
+            if self._cinema_job is not None and self._cinema_job.running():
+                self.view.show_error("A temperature sequence is already running")
+                return
+
+            # Create progress dialog.  The sequence itself runs on a worker,
+            # so this dialog can paint and its Cancel button can be clicked.
+            # Cancel stops before the next frame; it does not change a frame
+            # that was already registered.
             self.progress_dialog = QDialog(self.view)
             self.progress_dialog.setWindowTitle("Generating Temperature Sequence")
-            self.progress_dialog.setFixedSize(400, 100)
+            self.progress_dialog.setFixedSize(400, 140)
+            self.progress_dialog.setWindowModality(Qt.WindowModal)
             
             layout = QVBoxLayout(self.progress_dialog)
             
@@ -77,29 +89,72 @@ class AdvancedFeaturesController:
             self.progress_bar.setRange(0, len(real_files) - 1)
             self.progress_bar.setValue(0)
             layout.addWidget(self.progress_bar)
+
+            cancel_button = QPushButton("Cancel")
+            cancel_button.clicked.connect(self._request_cinema_cancel)
+            layout.addWidget(cancel_button)
+            self.progress_dialog.rejected.connect(self._request_cinema_cancel)
             
             # Show progress dialog
             self.progress_dialog.show()
             
             # Calculate temperature maps for the sequence
             self.view.update_status("Generating temperature map sequence...")
-            self.cinema_model.calculate_temperature_sequence(
-                real_files, 
-                imag_files, 
-                original_temperature, 
-                apply_gaussian, 
-                apply_b0_correction,
-                apply_motion_correction=apply_motion_correction,
-                registrar=self.registrar,
-                registration_config=self.registration_config,
+            self._cinema_stop = threading.Event()
+            if self._cinema_job is None:
+                self._cinema_job = BackgroundCall()
+
+            def work():
+                return self.cinema_model.calculate_temperature_sequence(
+                    real_files,
+                    imag_files,
+                    original_temperature,
+                    apply_gaussian,
+                    apply_b0_correction,
+                    apply_motion_correction=apply_motion_correction,
+                    registrar=self.registrar,
+                    registration_config=self.registration_config,
+                    stop_event=self._cinema_stop,
+                )
+
+            self._cinema_job.start(
+                work,
+                self._cinema_finished,
+                self._cinema_failed,
             )
             
         except Exception as e:
             import traceback
             traceback.print_exc()
             self.view.show_error(f"Error generating cinema: {str(e)}")
-            if hasattr(self, 'progress_dialog') and self.progress_dialog:
-                self.progress_dialog.close()
+            self._close_cinema_progress()
+
+    def _request_cinema_cancel(self):
+        """Stop before the next frame.  The current frame is left as it is."""
+        if self._cinema_stop is not None:
+            self._cinema_stop.set()
+        if getattr(self, "progress_label", None) is not None:
+            self.progress_label.setText("Cancelling after the current frame...")
+
+    def _cinema_finished(self, sequence):
+        """Close the progress dialog if the sequence did not open the player.
+
+        ``calculation_complete`` already opens the player when the model
+        returns a list.  An early ``None`` does not emit that signal.
+        """
+        if sequence is None:
+            self._close_cinema_progress()
+
+    def _cinema_failed(self, message):
+        self._close_cinema_progress()
+        self.view.show_error(f"Error generating cinema: {message}")
+
+    def _close_cinema_progress(self):
+        dialog = getattr(self, "progress_dialog", None)
+        if dialog is not None:
+            dialog.blockSignals(True)
+            dialog.close()
+            self.progress_dialog = None
     
     def update_cinema_progress(self, current, total):
         """Update progress dialog."""
@@ -109,9 +164,12 @@ class AdvancedFeaturesController:
     
     def show_cinema_dialog(self, temperature_sequence):
         """Show cinema dialog with the calculated temperature sequence."""
-        # Close progress dialog if it exists
+        # Close progress dialog if it exists.  Block signals so the window
+        # close is not treated as another cancel request.
         if hasattr(self, 'progress_dialog') and self.progress_dialog:
+            self.progress_dialog.blockSignals(True)
             self.progress_dialog.close()
+            self.progress_dialog = None
         
         # Store the temperature sequence in the view for later use by thermostat
         self.view.temperature_sequence = temperature_sequence

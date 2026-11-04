@@ -1,5 +1,7 @@
 """Sequence registration stays off unless it is explicitly requested."""
 
+import threading
+
 import numpy as np
 
 from mvc.models.cinema_model import CinemaModel
@@ -206,6 +208,46 @@ def test_a_failed_fixed_load_without_registration_is_stored_as_none():
     assert sequence[1] is None
     assert len(model.calls) == 1
     assert any("Failed to load real frame 2" in message for message in cinema.errors)
+
+
+def test_stop_event_keeps_frames_already_computed():
+    model = RecordingModel()
+    cinema = _cinema(model)
+    registrar = FrameRegistrar()
+    stop = threading.Event()
+
+    def register_and_stop(**kwargs):
+        outcome = FrameRegistrar.register_complex(registrar, **kwargs)
+        stop.set()
+        return outcome
+
+    registrar.register_complex = register_and_stop
+    sequence = cinema.calculate_temperature_sequence(
+        ["r0", "r1", "r2"],
+        ["i0", "i1", "i2"],
+        apply_motion_correction=True,
+        registrar=registrar,
+        stop_event=stop,
+    )
+
+    assert sequence == [sequence[0]]
+    assert sequence[0] is not None
+    assert len(registrar.calls) == 1
+    assert any("cancelled" in message for message in cinema.errors)
+    assert len(cinema.completed) == 1
+
+
+def test_stop_event_before_the_first_frame_stores_nothing():
+    cinema = _cinema(RecordingModel())
+    stop = threading.Event()
+    stop.set()
+
+    sequence = cinema.calculate_temperature_sequence(
+        ["r0", "r1"], ["i0", "i1"], stop_event=stop
+    )
+
+    assert sequence == []
+    assert any("cancelled" in message for message in cinema.errors)
 
 
 def test_motion_correction_without_a_registrar_is_refused():
