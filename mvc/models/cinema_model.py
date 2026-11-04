@@ -24,8 +24,18 @@ class CinemaModel(QObject):
         self.temperature_sequence = []
         
     def calculate_temperature_sequence(self, real_files, imag_files, original_temperature=37.0, 
-                                      apply_gaussian=False, apply_b0_correction=False):
-        """Calculate temperature maps for a sequence of real/imaginary file pairs."""
+                                      apply_gaussian=False, apply_b0_correction=False,
+                                      apply_motion_correction=False, registrar=None,
+                                      registration_config=None):
+        """Calculate temperature maps for a sequence of real/imaginary file pairs.
+
+        Motion correction is off unless ``apply_motion_correction`` is passed.
+        When it is on, every later frame is registered to the first frame and
+        the corrected copy is used for that pair only.  Consecutive-pair
+        registration is intentionally not the default: its error would
+        accumulate along the sequence.  A failed frame is stored as ``None``
+        and does not change the earlier frames.
+        """
         if len(real_files) < 2 or len(imag_files) < 2:
             self.error_occurred.emit("Need at least 2 real and 2 imaginary files for sequence calculation")
             return None
@@ -36,25 +46,64 @@ class CinemaModel(QObject):
         # Calculate total number of pairs
         total_pairs = len(real_files) - 1
         
-        # Process each consecutive pair of real/imaginary files
+        if apply_motion_correction and registrar is None:
+            self.error_occurred.emit(
+                "Motion correction for a sequence needs an explicit registrar"
+            )
+            return None
+
+        # With motion correction the fixed image is always the first frame.
+        # It is loaded once.  Registering each frame to the previous frame
+        # would let the correction error accumulate, so that is not done.
+        if apply_motion_correction:
+            if not self.thermometry_model.load_real1_dicom(real_files[0]):
+                self.error_occurred.emit("Failed to load the baseline real frame")
+                return None
+            if not self.thermometry_model.load_imag1_dicom(imag_files[0]):
+                self.error_occurred.emit("Failed to load the baseline imaginary frame")
+                return None
+
         for i in range(total_pairs):
             # Emit progress
             self.calculation_progress.emit(i, total_pairs)
+            fixed_index = 0 if apply_motion_correction else i
+            moving_index = i + 1
             
             try:
-                # Load first pair
-                self.thermometry_model.load_real1_dicom(real_files[i])
-                self.thermometry_model.load_imag1_dicom(imag_files[i])
+                if not apply_motion_correction:
+                    self.thermometry_model.load_real1_dicom(real_files[fixed_index])
+                    self.thermometry_model.load_imag1_dicom(imag_files[fixed_index])
                 
-                # Load second pair
-                self.thermometry_model.load_real2_dicom(real_files[i+1])
-                self.thermometry_model.load_imag2_dicom(imag_files[i+1])
+                # Load the moving pair.  This also clears a correction that
+                # belonged to the previous frame.
+                self.thermometry_model.load_real2_dicom(real_files[moving_index])
+                self.thermometry_model.load_imag2_dicom(imag_files[moving_index])
+
+                use_registration = False
+                if apply_motion_correction:
+                    result = registrar.register_complex(
+                        fixed_real=self.thermometry_model.real1,
+                        fixed_imag=self.thermometry_model.imag1,
+                        moving_real=self.thermometry_model.real2,
+                        moving_imag=self.thermometry_model.imag2,
+                        config=registration_config,
+                    )
+                    if result.status == "failed" or result.warped_real is None:
+                        self.temperature_sequence.append(None)
+                        self.error_occurred.emit(
+                            f"Motion correction failed for frame {moving_index + 1}: "
+                            f"{result.message}"
+                        )
+                        continue
+                    self.thermometry_model.registration_result = result
+                    use_registration = True
                 
                 # Calculate temperature
                 success = self.thermometry_model.calculate_temperature(
                     original_temperature=original_temperature,
                     apply_gaussian_filter=apply_gaussian,
-                    apply_b0_correction=apply_b0_correction
+                    apply_b0_correction=apply_b0_correction,
+                    use_registration=use_registration,
                 )
                 
                 if success and self.thermometry_model.temperature_map is not None:

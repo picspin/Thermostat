@@ -244,7 +244,10 @@ class ThermometryView(QMainWindow):
         
         # Motion correction checkbox - New feature
         self.motion_correction_checkbox = QCheckBox('Apply Motion Correction', self)
-        self.motion_correction_checkbox.setToolTip('Uses elastic registration with 1st real image as reference')
+        self.motion_correction_checkbox.setToolTip(
+            'Uses elastic registration with the 1st real image as reference. '
+            'For a Cinema sequence, every later frame is registered to the first frame.'
+        )
         options_layout.addWidget(self.motion_correction_checkbox)
         
         options_group.setLayout(options_layout)
@@ -552,9 +555,14 @@ class ThermometryView(QMainWindow):
         else:
             self.roi_results.clear()
         
-    def update_status(self, message):
-        """Update the status bar with a message."""
-        self.statusBar.showMessage(message, 5000)  # Show for 5 seconds
+    def update_status(self, message, timeout_ms=5000):
+        """Update the status bar with a message.
+
+        ``timeout_ms`` is how long the message stays visible.  ``0`` keeps it
+        until the next status update, which is used for a registration warning
+        that must not disappear behind "Temperature calculation complete".
+        """
+        self.statusBar.showMessage(message, timeout_ms)
         
         # 如果是关于文件识别或加载的日志信息，添加到日志区域
         if any(keyword in message for keyword in ['file', 'Found', 'Loaded', 'Warning', 'sorted', 'time']):

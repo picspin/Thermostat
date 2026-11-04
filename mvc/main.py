@@ -53,7 +53,13 @@ def main():
     
     # Create controllers
     thermometry_controller = ThermometryController(thermometry_model, view)
-    advanced_features_controller = AdvancedFeaturesController(view, cinema_model, thermostat_model)
+    advanced_features_controller = AdvancedFeaturesController(
+        view,
+        cinema_model,
+        thermostat_model,
+        registrar=thermometry_controller.registrar,
+        registration_config=thermometry_controller.registration_config,
+    )
     
     # Show the main window
     view.show()

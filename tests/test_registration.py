@@ -67,6 +67,13 @@ def test_register_complex_returns_warped_arrays_and_metrics():
     assert result.elapsed_s >= 0.0
     assert result.iterations >= 0
     assert result.stop_condition
+    assert np.isfinite(result.ncc_before)
+    assert np.isfinite(result.ncc_after)
+    assert np.isfinite(result.mae_before)
+    assert np.isfinite(result.mae_after)
+    assert result.displacement_rms >= 0.0
+    assert result.displacement_max >= result.displacement_rms
+    assert 0.0 <= result.folding_ratio <= 1.0
 
 
 def test_register_complex_does_not_mutate_inputs():
