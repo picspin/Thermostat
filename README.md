@@ -91,7 +91,9 @@ python -m pytest
 
 测试不需要显示服务器；配准模块的单元测试不依赖 Qt，模型状态测试只使用 QObject。
 
-默认运动校正仍是 SimpleITK B-spline。另有一个必须显式启用的单病例 INR 容积校正，以及独立的低秩加稀疏分析；说明见 [docs/inr_volume_correction.md](docs/inr_volume_correction.md)。二者都不会改变默认配准参数或默认温度结果。
+默认运动校正仍是 SimpleITK B-spline，默认参数不变。校正结果额外记录 NCC、MAE、位移和折叠比例，但这些数值不改变是否接受这次校正。Cinema 只有在勾选运动校正时才配准，并且每一帧都以第一帧为参考。另有一个必须显式启用的单病例 INR 容积校正，以及独立的低秩加稀疏分析；说明见 [docs/inr_volume_correction.md](docs/inr_volume_correction.md)。
+
+推送和拉取请求会运行 `.github/workflows/tests.yml`：安装依赖、`compileall` 和 `pytest`。它不启动图形界面。
 
 ## 许可证
 

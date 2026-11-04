@@ -6,6 +6,9 @@ import pytest
 from mvc.models.registration import (
     RegistrationConfig,
     SimpleITKRegistrar,
+    _magnitude_max,
+    _magnitude_rms,
+    _ncc,
 )
 
 
@@ -67,6 +70,13 @@ def test_register_complex_returns_warped_arrays_and_metrics():
     assert result.elapsed_s >= 0.0
     assert result.iterations >= 0
     assert result.stop_condition
+    assert np.isfinite(result.ncc_before)
+    assert np.isfinite(result.ncc_after)
+    assert np.isfinite(result.mae_before)
+    assert np.isfinite(result.mae_after)
+    assert result.displacement_rms >= 0.0
+    assert result.displacement_max >= result.displacement_rms
+    assert 0.0 <= result.folding_ratio <= 1.0
 
 
 def test_register_complex_does_not_mutate_inputs():
@@ -134,6 +144,25 @@ def test_mismatched_shapes_raise_value_error():
         SimpleITKRegistrar().register_complex(
             np.zeros((4, 4)), None, np.zeros((5, 5)), None
         )
+
+
+def test_ncc_is_undefined_for_a_constant_image():
+    constant_a = np.full((4, 4), 5.0)
+    constant_b = np.full((4, 4), 9.0)
+    varying = np.arange(16, dtype=float).reshape(4, 4)
+
+    assert np.isnan(_ncc(constant_a, constant_b))
+    assert np.isnan(_ncc(constant_a, constant_a))
+    assert np.isnan(_ncc(constant_a, varying))
+    assert _ncc(varying, varying) == pytest.approx(1.0)
+    assert _ncc(varying, -varying) == pytest.approx(-1.0)
+
+
+def test_magnitude_diagnostics_stay_nan_when_the_field_cannot_be_read():
+    assert np.isnan(_magnitude_rms(object()))
+    assert np.isnan(_magnitude_max(object()))
+    assert np.isnan(_magnitude_rms(None))
+    assert np.isnan(_magnitude_max(None))
 
 
 def test_execute_failure_is_reported_in_the_result():

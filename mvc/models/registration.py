@@ -89,6 +89,16 @@ class RegistrationResult:
     elapsed_s: float
     status: str = STATUS_OK
     message: str = ""
+    # Diagnostics added after the historical fields.  They are not used to
+    # decide the B-spline status, so a default configuration still warps the
+    # same arrays and returns the same status as before.
+    ncc_before: float = float("nan")
+    ncc_after: float = float("nan")
+    mae_before: float = float("nan")
+    mae_after: float = float("nan")
+    displacement_rms: float = float("nan")
+    displacement_max: float = float("nan")
+    folding_ratio: float = float("nan")
 
     @property
     def succeeded(self) -> bool:
@@ -160,6 +170,9 @@ class SimpleITKRegistrar:
                 )
 
             dice = self._dice(fixed_image, fixed_array, warped_real)
+            diagnostics = _similarity_diagnostics(
+                fixed_array, moving_array, warped_real, final_transform, fixed_image
+            )
             if dice < config.dice_warning_threshold:
                 status = STATUS_WARNING
                 message = (
@@ -183,6 +196,13 @@ class SimpleITKRegistrar:
                 elapsed_s=time.perf_counter() - start,
                 status=status,
                 message=message,
+                ncc_before=diagnostics["ncc_before"],
+                ncc_after=diagnostics["ncc_after"],
+                mae_before=diagnostics["mae_before"],
+                mae_after=diagnostics["mae_after"],
+                displacement_rms=diagnostics["displacement_rms"],
+                displacement_max=diagnostics["displacement_max"],
+                folding_ratio=diagnostics["folding_ratio"],
             )
         except Exception as exc:  # noqa: BLE001 - surfaced through the result
             return RegistrationResult(
@@ -261,7 +281,7 @@ class SimpleITKRegistrar:
         try:
             return self._INTERPOLATORS[name]
         except KeyError:
-            raise ValueError(f"Unsupported interpolator: {name!r}")
+            raise ValueError(f"Unsupported interpolator: {name!r}") from None
 
     @staticmethod
     def _resample(moving_image, fixed_image, transform, interpolator):
@@ -293,3 +313,111 @@ class SimpleITKRegistrar:
         overlap = sitk.LabelOverlapMeasuresImageFilter()
         overlap.Execute(fixed_binary, moving_binary)
         return float(overlap.GetDiceCoefficient())
+
+
+def _similarity_diagnostics(fixed, moving, warped, transform, reference_image):
+    """Record quality numbers without changing the registration decision.
+
+    NCC and MAE compare the real component before and after resampling.
+    Displacement and folding are sampled from the transform on the reference
+    grid.  A transform that cannot report either one leaves that field as
+    NaN; it does not fail the registration.  None of these numbers is
+    compared with a threshold.
+    """
+    field = _displacement_grid(transform, reference_image)
+    return {
+        "ncc_before": _ncc(fixed, moving),
+        "ncc_after": _ncc(fixed, warped),
+        "mae_before": _mae(fixed, moving),
+        "mae_after": _mae(fixed, warped),
+        "displacement_rms": _magnitude_rms(field),
+        "displacement_max": _magnitude_max(field),
+        "folding_ratio": _folding_ratio(field),
+    }
+
+
+def _ncc(left, right):
+    """Pearson correlation.  A constant image makes it undefined.
+
+    Centering first would turn every constant image into zeros, so two
+    different constants would compare equal and incorrectly return 1.
+    """
+    left = np.asarray(left, dtype=float).ravel()
+    right = np.asarray(right, dtype=float).ravel()
+    if left.shape != right.shape or left.size == 0:
+        return float("nan")
+    if np.ptp(left) == 0.0 or np.ptp(right) == 0.0:
+        return float("nan")
+    left = left - float(np.mean(left))
+    right = right - float(np.mean(right))
+    denom = float(np.linalg.norm(left) * np.linalg.norm(right))
+    if denom == 0.0:
+        return float("nan")
+    return float(np.dot(left, right) / denom)
+
+
+def _mae(left, right):
+    left = np.asarray(left, dtype=float)
+    right = np.asarray(right, dtype=float)
+    return float(np.mean(np.abs(left - right)))
+
+
+def _displacement_grid(transform, reference_image):
+    """Sample the transform on the reference grid.
+
+    ``TransformToDisplacementField`` has no image overload: without an
+    explicit size it silently uses a 64³ default, which is neither the
+    registered image nor a useful diagnostic.
+    """
+    try:
+        field = sitk.TransformToDisplacementField(
+            transform,
+            sitk.sitkVectorFloat64,
+            reference_image.GetSize(),
+            reference_image.GetOrigin(),
+            reference_image.GetSpacing(),
+            reference_image.GetDirection(),
+        )
+    except Exception:  # noqa: BLE001 - diagnostic only; registration already ran
+        return None
+    return field
+
+
+def _magnitude_rms(field):
+    if field is None:
+        return float("nan")
+    try:
+        values = sitk.GetArrayFromImage(field)
+        magnitude = np.linalg.norm(values, axis=-1)
+        if magnitude.size == 0:
+            return float("nan")
+        return float(np.sqrt(np.mean(np.square(magnitude))))
+    except Exception:  # noqa: BLE001 - diagnostic only; registration already ran
+        return float("nan")
+
+
+def _magnitude_max(field):
+    if field is None:
+        return float("nan")
+    try:
+        values = sitk.GetArrayFromImage(field)
+        magnitude = np.linalg.norm(values, axis=-1)
+        if magnitude.size == 0:
+            return float("nan")
+        return float(np.max(magnitude))
+    except Exception:  # noqa: BLE001 - diagnostic only; registration already ran
+        return float("nan")
+
+
+def _folding_ratio(field):
+    """Fraction of voxels whose Jacobian determinant is not positive."""
+    if field is None:
+        return float("nan")
+    try:
+        jacobian = sitk.DisplacementFieldJacobianDeterminant(field)
+    except Exception:  # noqa: BLE001 - diagnostic only
+        return float("nan")
+    values = sitk.GetArrayFromImage(jacobian)
+    if values.size == 0:
+        return float("nan")
+    return float(np.mean(values <= 0.0))

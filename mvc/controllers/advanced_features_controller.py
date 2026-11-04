@@ -12,11 +12,19 @@ import matplotlib.animation as animation
 class AdvancedFeaturesController:
     """Controller for advanced features like Cinema and Thermostat."""
     
-    def __init__(self, view, cinema_model, thermostat_model):
-        """Initialize with references to view and models."""
+    def __init__(self, view, cinema_model, thermostat_model, registrar=None,
+                 registration_config=None):
+        """Initialize with references to view and models.
+
+        ``registrar`` is optional.  The sequence still does not register
+        unless the motion-correction checkbox is checked, and then it uses
+        this registrar against the first frame.
+        """
         self.view = view
         self.cinema_model = cinema_model
         self.thermostat_model = thermostat_model
+        self.registrar = registrar
+        self.registration_config = registration_config
         
         # Connect signals
         self.connect_signals()
@@ -53,6 +61,7 @@ class AdvancedFeaturesController:
             original_temperature = self.view.original_temp_input.value()
             apply_gaussian = self.view.gaussian_filter_checkbox.isChecked()
             apply_b0_correction = self.view.b0_correction_checkbox.isChecked()
+            apply_motion_correction = self.view.motion_correction_checkbox.isChecked()
             
             # Create progress dialog
             self.progress_dialog = QDialog(self.view)
@@ -79,7 +88,10 @@ class AdvancedFeaturesController:
                 imag_files, 
                 original_temperature, 
                 apply_gaussian, 
-                apply_b0_correction
+                apply_b0_correction,
+                apply_motion_correction=apply_motion_correction,
+                registrar=self.registrar,
+                registration_config=self.registration_config,
             )
             
         except Exception as e:

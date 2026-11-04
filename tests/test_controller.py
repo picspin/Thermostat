@@ -12,8 +12,10 @@ class FakeView:
         self.errors = []
         self.temperature_updates = []
 
-    def update_status(self, message):
+    def update_status(self, message, timeout_ms=5000):
         self.statuses.append(message)
+        self.status_timeouts = getattr(self, "status_timeouts", [])
+        self.status_timeouts.append(timeout_ms)
 
     def show_error(self, message):
         self.errors.append(message)
@@ -113,6 +115,16 @@ def test_apply_motion_correction_reports_warning():
     assert controller.apply_motion_correction() is True
 
     assert any("Warning: Registration quality" in item for item in view.statuses)
+
+
+def test_registration_warning_survives_the_completion_status():
+    controller, _, view, _ = _controller(_result(dice=0.8, status="warning"))
+
+    controller.calculate_temperature(37.0, False, False, True)
+
+    assert "Temperature calculation complete" in view.statuses[-1]
+    assert "Warning: Registration quality" in view.statuses[-1]
+    assert view.status_timeouts[-1] == 0
 
 
 def test_apply_motion_correction_reports_failure():

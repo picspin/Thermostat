@@ -137,15 +137,33 @@ class ThermometryController:
             return False
 
         self.model.registration_result = result
-        self.view.update_status(
-            f"Motion correction applied - DICE coefficient: {result.dice:.3f}"
-        )
+        self.view.update_status(self._registration_status(result))
+        return True
+
+    def _registration_status(self, result):
+        """One status line, including the diagnostics recorded with the warp.
+
+        A quality warning is part of this same line.  Splitting it into a
+        second status call let the following "calculation complete" message
+        replace it before it could be read.
+        """
+        parts = [f"Motion correction applied - DICE coefficient: {result.dice:.3f}"]
+        if result.iterations:
+            parts.append(f"iterations={result.iterations}")
+        if result.stop_condition:
+            parts.append(f"stop={result.stop_condition}")
+        if np.isfinite(result.ncc_before) and np.isfinite(result.ncc_after):
+            parts.append(f"NCC {result.ncc_before:.3f}->{result.ncc_after:.3f}")
+        if np.isfinite(result.displacement_rms):
+            parts.append(f"displacement RMS {result.displacement_rms:.2f}px")
+        if np.isfinite(result.folding_ratio) and result.folding_ratio > 0.0:
+            parts.append(f"folding {result.folding_ratio:.3f}")
         if result.status == "warning":
-            self.view.update_status(
+            parts.append(
                 "Warning: Registration quality may be insufficient "
                 f"(DICE < {self.registration_config.dice_warning_threshold})"
             )
-        return True
+        return "; ".join(parts)
         
     def calculate_temperature(self, original_temperature, apply_gaussian, apply_b0_correction, apply_motion_correction):
         """Handle temperature calculation request."""
@@ -176,7 +194,15 @@ class ThermometryController:
         if success:
             # Update the view with the temperature map
             self.view.update_temperature_display(self.model.temperature_map)
-            self.view.update_status("Temperature calculation complete")
+            if use_registration and self.model.registration_result is not None \
+                    and self.model.registration_result.status == "warning":
+                warning = self._registration_status(self.model.registration_result)
+                self.view.update_status(
+                    "Temperature calculation complete. " + warning,
+                    timeout_ms=0,
+                )
+            else:
+                self.view.update_status("Temperature calculation complete")
         else:
             self.view.show_error("Temperature calculation failed")
         
