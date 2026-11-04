@@ -91,6 +91,8 @@ python -m pytest
 
 测试不需要显示服务器；配准模块的单元测试不依赖 Qt，模型状态测试只使用 QObject。
 
+默认运动校正仍是 SimpleITK B-spline。另有一个必须显式启用的单病例 INR 容积校正，以及独立的低秩加稀疏分析；说明见 [docs/inr_volume_correction.md](docs/inr_volume_correction.md)。二者都不会改变默认配准参数或默认温度结果。
+
 ## 许可证
 
 本项目采用[MIT许可证](LICENSE)。
