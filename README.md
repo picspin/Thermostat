@@ -80,6 +80,17 @@ MR热统计系统是一个用于磁共振成像（MRI）热图分析的Python应
 2. 使用"Window Width"控制显示的温度范围
 3. 点击"Auto Window"自动优化窗宽窗位
 
+## 开发与测试
+
+运行单元测试：
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest
+```
+
+测试不需要显示服务器；配准模块的单元测试不依赖 Qt，模型状态测试只使用 QObject。
+
 ## 许可证
 
 本项目采用[MIT许可证](LICENSE)。
