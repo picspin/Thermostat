@@ -47,9 +47,16 @@ class RegistrationConfig:
         smoothing_sigmas: Smoothing sigmas per resolution level.
         smoothing_sigmas_in_physical_units: Whether sigmas are in physical
             units (historical behavior: yes).
-        mesh_size: B-spline mesh size per dimension.
+        mesh_size: B-spline mesh size per dimension.  Used only for
+            ``transform_kind="bspline"``.
         interpolator: ``"linear"``, ``"nearest"`` or ``"bspline"``.
         dice_warning_threshold: DICE below this value produces a warning.
+        transform_kind: ``"bspline"`` (historical default), ``"rigid"`` or
+            ``"affine"``.  The default UI path stays B-spline.
+        foreground_mask: When true, the metric samples only voxels at or
+            above ``foreground_percentile``.  The default is off, so the
+            historical sampling is unchanged.
+        foreground_percentile: Percentile used to build that mask.
     """
 
     metric: str = "mattes_mi"
@@ -66,6 +73,9 @@ class RegistrationConfig:
     mesh_size: int = 8
     interpolator: str = "linear"
     dice_warning_threshold: float = 0.9
+    transform_kind: str = "bspline"
+    foreground_mask: bool = False
+    foreground_percentile: float = 80.0
 
 
 @dataclass
@@ -106,11 +116,12 @@ class RegistrationResult:
 
 
 class SimpleITKRegistrar:
-    """SimpleITK B-spline registrar for 2D/3D motion correction.
+    """SimpleITK registrar for 2D/3D motion correction.
 
-    The transform is estimated from the real component and then applied to
-    both real and imaginary components.  Estimating one transform for both is
-    required for phase-consistent thermometry.
+    The default transform is the historical B-spline.  Rigid and affine are
+    opt-in through ``RegistrationConfig.transform_kind`` and do not change
+    that default.  The transform is estimated from the real component and
+    then applied to both real and imaginary components.
     """
 
     _METRIC_NAMES = {
@@ -230,13 +241,66 @@ class SimpleITKRegistrar:
         self._configure_optimizer(method, config)
         self._configure_pyramid(method, config)
         method.SetInterpolator(self._interpolator(config.interpolator))
+        if config.foreground_mask:
+            self._configure_foreground_mask(
+                method, fixed_image, moving_image, config
+            )
 
-        mesh_size = [int(config.mesh_size)] * fixed_image.GetDimension()
-        transform = sitk.BSplineTransformInitializer(fixed_image, mesh_size)
+        transform = self._initial_transform(fixed_image, config)
         method.SetInitialTransform(transform)
 
         final_transform = method.Execute(fixed_image, moving_image)
         return final_transform, method
+
+    def _initial_transform(self, fixed_image, config):
+        """Initial transform.  The default kind is still a B-spline."""
+        kind = config.transform_kind
+        dimension = fixed_image.GetDimension()
+        if kind == "bspline":
+            mesh_size = [int(config.mesh_size)] * dimension
+            return sitk.BSplineTransformInitializer(fixed_image, mesh_size)
+        if kind == "rigid":
+            if dimension == 2:
+                return sitk.Euler2DTransform()
+            if dimension == 3:
+                return sitk.Euler3DTransform()
+            raise ValueError(
+                f"rigid registration does not support dimension {dimension}"
+            )
+        if kind == "affine":
+            if dimension in (2, 3):
+                return sitk.AffineTransform(dimension)
+            raise ValueError(
+                f"affine registration does not support dimension {dimension}"
+            )
+        raise ValueError(f"Unsupported transform_kind: {kind!r}")
+
+    def _configure_foreground_mask(self, method, fixed_image, moving_image, config):
+        method.SetMetricFixedMask(
+            self._foreground_mask(fixed_image, config.foreground_percentile)
+        )
+        method.SetMetricMovingMask(
+            self._foreground_mask(moving_image, config.foreground_percentile)
+        )
+
+    @staticmethod
+    def _foreground_mask(image, percentile):
+        array = sitk.GetArrayFromImage(image)
+        finite = array[np.isfinite(array)]
+        if finite.size == 0:
+            raise ValueError("foreground mask needs a finite image")
+        threshold = float(np.percentile(finite, float(percentile)))
+        upper = float(np.max(finite))
+        if threshold > upper:
+            threshold = upper
+        mask = sitk.BinaryThreshold(
+            image,
+            lowerThreshold=threshold,
+            upperThreshold=upper,
+            insideValue=1,
+            outsideValue=0,
+        )
+        return sitk.Cast(mask, sitk.sitkUInt8)
 
     def _configure_metric(self, method, config):
         if config.metric == "mattes_mi":

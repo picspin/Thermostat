@@ -47,6 +47,8 @@ def test_defaults_match_the_historical_controller_configuration():
     assert config.smoothing_sigmas == (2.0, 1.0, 0.0)
     assert config.mesh_size == 8
     assert config.dice_warning_threshold == 0.9
+    assert config.transform_kind == "bspline"
+    assert config.foreground_mask is False
 
 
 def test_register_complex_returns_warped_arrays_and_metrics():
@@ -163,6 +165,62 @@ def test_magnitude_diagnostics_stay_nan_when_the_field_cannot_be_read():
     assert np.isnan(_magnitude_max(object()))
     assert np.isnan(_magnitude_rms(None))
     assert np.isnan(_magnitude_max(None))
+
+
+def test_rigid_and_affine_are_opt_in():
+    fixed = _phantom((32, 32))
+    moving = np.roll(fixed, (2, -1), axis=(0, 1))
+
+    rigid = SimpleITKRegistrar().register_complex(
+        fixed,
+        None,
+        moving,
+        None,
+        _config(transform_kind="rigid", iterations=15),
+    )
+    affine = SimpleITKRegistrar().register_complex(
+        fixed,
+        None,
+        moving,
+        None,
+        _config(transform_kind="affine", iterations=15),
+    )
+
+    assert rigid.succeeded
+    assert affine.succeeded
+    assert rigid.warped_real.shape == fixed.shape
+    assert affine.warped_real.shape == fixed.shape
+    assert "Euler" in rigid.transform.GetName()
+    assert "Affine" in affine.transform.GetName()
+
+
+def test_foreground_mask_is_opt_in_and_can_run():
+    fixed = _phantom((32, 32))
+    moving = np.roll(fixed, (1, -1), axis=(0, 1))
+
+    result = SimpleITKRegistrar().register_complex(
+        fixed,
+        None,
+        moving,
+        None,
+        _config(foreground_mask=True, foreground_percentile=50, iterations=5),
+    )
+
+    assert result.succeeded
+    assert result.config.foreground_mask is True
+    assert result.warped_real.shape == fixed.shape
+
+
+def test_unknown_transform_kind_fails_without_a_partial_warp():
+    fixed = _phantom((16, 16))
+
+    result = SimpleITKRegistrar().register_complex(
+        fixed, None, fixed, None, _config(transform_kind="tps")
+    )
+
+    assert result.status == "failed"
+    assert result.warped_real is None
+    assert "transform_kind" in result.message
 
 
 def test_execute_failure_is_reported_in_the_result():
