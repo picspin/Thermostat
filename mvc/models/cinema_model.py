@@ -26,7 +26,7 @@ class CinemaModel(QObject):
     def calculate_temperature_sequence(self, real_files, imag_files, original_temperature=37.0, 
                                       apply_gaussian=False, apply_b0_correction=False,
                                       apply_motion_correction=False, registrar=None,
-                                      registration_config=None):
+                                      registration_config=None, stop_event=None):
         """Calculate temperature maps for a sequence of real/imaginary file pairs.
 
         Motion correction is off unless ``apply_motion_correction`` is passed.
@@ -36,6 +36,10 @@ class CinemaModel(QObject):
         accumulate along the sequence.  A frame whose images fail to load, or
         whose registration fails, is stored as ``None``.  The previous frame
         is not reused, and earlier results are left unchanged.
+
+        ``stop_event`` is optional.  When it is set, the loop stops before
+        the next frame.  The frame already in progress finishes, and frames
+        already stored are kept.  Leaving it unset does not change the result.
         """
         if len(real_files) < 2 or len(imag_files) < 2:
             self.error_occurred.emit("Need at least 2 real and 2 imaginary files for sequence calculation")
@@ -65,6 +69,9 @@ class CinemaModel(QObject):
                 return None
 
         for i in range(total_pairs):
+            if stop_event is not None and stop_event.is_set():
+                self.error_occurred.emit("Sequence calculation cancelled")
+                break
             # Emit progress
             self.calculation_progress.emit(i, total_pairs)
             fixed_index = 0 if apply_motion_correction else i

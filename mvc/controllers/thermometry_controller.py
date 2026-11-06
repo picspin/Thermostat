@@ -1,5 +1,8 @@
 import os
 import numpy as np
+from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import QApplication, QProgressDialog, QWidget
+from mvc.controllers.background_work import BackgroundCall
 from mvc.models.registration import RegistrationConfig, SimpleITKRegistrar
 import pydicom
 from datetime import datetime
@@ -21,6 +24,10 @@ class ThermometryController:
             if registration_config is not None
             else RegistrationConfig()
         )
+        self._motion_job = None
+        self._motion_dialog = None
+        self._motion_cancelled = False
+        self._wait_cursor = False
         
         # Connect view signals to controller methods
         self.connect_signals()
@@ -37,8 +44,10 @@ class ThermometryController:
         # 添加批量加载信号连接
         self.view.batch_load_dicom_signal.connect(self.batch_load_dicom)
         
-        # Calculation and reset signals
-        self.view.calculate_signal.connect(self.calculate_temperature)
+        # Calculation and reset signals.  The direct method stays synchronous
+        # for tests and for the no-registration path.  The GUI slot moves only
+        # the registration itself off the UI thread.
+        self.view.calculate_signal.connect(self.begin_calculate_temperature)
         self.view.reset_signal.connect(self.reset_data)
         
         # Save signals
@@ -131,14 +140,7 @@ class ThermometryController:
             self.view.show_error(f"Error in motion correction: {exc}")
             return False
 
-        if result.status == "failed":
-            self.model.registration_result = None
-            self.view.show_error(f"Error in motion correction: {result.message}")
-            return False
-
-        self.model.registration_result = result
-        self.view.update_status(self._registration_status(result))
-        return True
+        return self._accept_registration(result)
 
     def _registration_status(self, result):
         """One status line, including the diagnostics recorded with the warp.
@@ -165,8 +167,94 @@ class ThermometryController:
             )
         return "; ".join(parts)
         
+    def begin_calculate_temperature(
+        self,
+        original_temperature,
+        apply_gaussian,
+        apply_b0_correction,
+        apply_motion_correction,
+    ):
+        """GUI entry.  Registration runs off the UI thread; the numbers do not change.
+
+        Without motion correction this is the synchronous calculation.  With
+        motion correction the SimpleITK call runs on a worker.  Cancel discards
+        that result and does not calculate a temperature.  A finished
+        registration that the user did not cancel uses the same accept and
+        fallback rules as ``calculate_temperature``.
+        """
+        missing = (
+            self.model.real1 is None
+            or self.model.imag1 is None
+            or self.model.real2 is None
+            or self.model.imag2 is None
+        )
+        if missing:
+            self.view.show_error(
+                "Missing required DICOM data. Please load all required DICOM files."
+            )
+            return
+        if not apply_motion_correction:
+            self.calculate_temperature(
+                original_temperature,
+                apply_gaussian,
+                apply_b0_correction,
+                False,
+            )
+            return
+        self._ensure_motion_job()
+        if self._motion_job.running():
+            self.view.show_error("Motion correction is already running")
+            return
+
+        self._motion_cancelled = False
+        self._motion_generation = getattr(self, "_motion_generation", 0) + 1
+        generation = self._motion_generation
+        snapshot = self._image_snapshot()
+        arrays = self._registration_arrays()
+        registrar = self.registrar
+        config = self.registration_config
+
+        def work():
+            return registrar.register_complex(
+                fixed_real=arrays[0],
+                fixed_imag=arrays[1],
+                moving_real=arrays[2],
+                moving_imag=arrays[3],
+                config=config,
+            )
+
+        self.view.update_status("Applying motion correction...")
+        self._set_wait_cursor()
+        self._set_calc_button_enabled(False)
+        self._show_motion_dialog()
+        self._motion_job.start(
+            work,
+            lambda result: self._finish_background_registration(
+                result,
+                None,
+                original_temperature,
+                apply_gaussian,
+                apply_b0_correction,
+                snapshot,
+                generation,
+            ),
+            lambda message: self._finish_background_registration(
+                None,
+                message,
+                original_temperature,
+                apply_gaussian,
+                apply_b0_correction,
+                snapshot,
+                generation,
+            ),
+        )
+
     def calculate_temperature(self, original_temperature, apply_gaussian, apply_b0_correction, apply_motion_correction):
-        """Handle temperature calculation request."""
+        """Handle temperature calculation request.
+
+        This path stays synchronous.  Direct callers and tests use it, and the
+        registration parameters are the same ones the background path uses.
+        """
         # Check if we have all required data
         if self.model.real1 is None or self.model.imag1 is None or self.model.real2 is None or self.model.imag2 is None:
             self.view.show_error("Missing required DICOM data. Please load all required DICOM files.")
@@ -183,7 +271,20 @@ class ThermometryController:
             else:
                 use_registration = True
         
-        # Calculate temperature
+        self._show_temperature_result(
+            original_temperature,
+            apply_gaussian,
+            apply_b0_correction,
+            use_registration,
+        )
+
+    def _show_temperature_result(
+        self,
+        original_temperature,
+        apply_gaussian,
+        apply_b0_correction,
+        use_registration,
+    ):
         success = self.model.calculate_temperature(
             original_temperature=original_temperature,
             apply_gaussian_filter=apply_gaussian,
@@ -205,6 +306,144 @@ class ThermometryController:
                 self.view.update_status("Temperature calculation complete")
         else:
             self.view.show_error("Temperature calculation failed")
+
+    def _finish_background_registration(
+        self,
+        result,
+        error_message,
+        original_temperature,
+        apply_gaussian,
+        apply_b0_correction,
+        snapshot,
+        generation,
+    ):
+        """Apply a worker result on the GUI thread.  Cancel does not warp.
+
+        ``generation`` ignores a result that was cancelled or superseded.
+        A stale callback must not enable the button or store a warp over
+        the job that replaced it.
+        """
+        if generation != getattr(self, "_motion_generation", None):
+            return
+        self._close_motion_dialog()
+        self._restore_cursor()
+        self._set_calc_button_enabled(True)
+        if self._motion_cancelled:
+            self.view.update_status("Motion correction cancelled")
+            return
+        if snapshot != self._image_snapshot():
+            self.view.show_error(
+                "Images changed during motion correction. The correction was discarded."
+            )
+            return
+        if error_message is not None:
+            self.model.registration_result = None
+            self.view.show_error(f"Error in motion correction: {error_message}")
+            self.view.show_error("Motion correction failed. Proceeding without it.")
+            use_registration = False
+        else:
+            use_registration = self._accept_registration(result)
+            if not use_registration:
+                self.view.show_error("Motion correction failed. Proceeding without it.")
+        self._show_temperature_result(
+            original_temperature,
+            apply_gaussian,
+            apply_b0_correction,
+            use_registration,
+        )
+
+    def _accept_registration(self, result):
+        if result.status == "failed":
+            self.model.registration_result = None
+            self.view.show_error(f"Error in motion correction: {result.message}")
+            return False
+        self.model.registration_result = result
+        self.view.update_status(self._registration_status(result))
+        return True
+
+    def _ensure_motion_job(self):
+        if getattr(self, "_motion_job", None) is None:
+            self._motion_job = BackgroundCall()
+        if not hasattr(self, "_motion_cancelled"):
+            self._motion_cancelled = False
+            self._motion_dialog = None
+            self._wait_cursor = False
+
+    def _image_snapshot(self):
+        return (
+            id(self.model.real1),
+            id(self.model.imag1),
+            id(self.model.real2),
+            id(self.model.imag2),
+        )
+
+    def _registration_arrays(self):
+        """Copies, so a later load on the GUI thread cannot change the fit."""
+        def copy(array):
+            if array is None:
+                return None
+            return np.array(array, copy=True)
+
+        return (
+            copy(self.model.real1),
+            copy(self.model.imag1),
+            copy(self.model.real2),
+            copy(self.model.imag2),
+        )
+
+    def _show_motion_dialog(self):
+        parent = self.view if isinstance(self.view, QWidget) else None
+        dialog = QProgressDialog(
+            "Applying motion correction...",
+            "Cancel",
+            0,
+            0,
+            parent,
+        )
+        dialog.setWindowTitle("Motion correction")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.canceled.connect(self._cancel_motion_correction)
+        dialog.show()
+        self._motion_dialog = dialog
+
+    def _cancel_motion_correction(self):
+        self._motion_cancelled = True
+        # The worker may still be inside SimpleITK.  Bump the generation so
+        # its late callback cannot apply the warp after the dialog is gone.
+        self._motion_generation = getattr(self, "_motion_generation", 0) + 1
+        self._close_motion_dialog()
+        self._restore_cursor()
+        self._set_calc_button_enabled(True)
+        if hasattr(self.view, "update_status"):
+            self.view.update_status("Cancelling motion correction...")
+
+    def _close_motion_dialog(self):
+        dialog = getattr(self, "_motion_dialog", None)
+        self._motion_dialog = None
+        if dialog is not None:
+            dialog.blockSignals(True)
+            dialog.close()
+
+    def _set_wait_cursor(self):
+        if QApplication.instance() is None:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self._wait_cursor = True
+
+    def _restore_cursor(self):
+        if not getattr(self, "_wait_cursor", False):
+            return
+        if QApplication.instance() is not None:
+            QApplication.restoreOverrideCursor()
+        self._wait_cursor = False
+
+    def _set_calc_button_enabled(self, enabled):
+        button = getattr(self.view, "calc_button", None)
+        if button is not None:
+            button.setEnabled(enabled)
         
     def reset_data(self):
         """Handle reset request."""
