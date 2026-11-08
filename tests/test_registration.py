@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+import SimpleITK as sitk
 
 from mvc.models.registration import (
     RegistrationConfig,
@@ -47,6 +48,8 @@ def test_defaults_match_the_historical_controller_configuration():
     assert config.smoothing_sigmas == (2.0, 1.0, 0.0)
     assert config.mesh_size == 8
     assert config.dice_warning_threshold == 0.9
+    assert config.transform_kind == "bspline"
+    assert config.foreground_mask is False
 
 
 def test_register_complex_returns_warped_arrays_and_metrics():
@@ -163,6 +166,166 @@ def test_magnitude_diagnostics_stay_nan_when_the_field_cannot_be_read():
     assert np.isnan(_magnitude_max(object()))
     assert np.isnan(_magnitude_rms(None))
     assert np.isnan(_magnitude_max(None))
+
+
+def _resample_euler(image, angle_deg=0.0, translation=(0.0, 0.0)):
+    """Move a 2D array with the same Euler convention the registrar returns."""
+    source = sitk.GetImageFromArray(np.asarray(image, dtype=np.float64))
+    transform = sitk.Euler2DTransform()
+    transform.SetCenter(
+        ((image.shape[1] - 1) / 2.0, (image.shape[0] - 1) / 2.0)
+    )
+    transform.SetAngle(np.deg2rad(angle_deg))
+    transform.SetTranslation(tuple(translation))
+    moved = sitk.Resample(source, source, transform, sitk.sitkLinear, 0.0)
+    return sitk.GetArrayFromImage(moved)
+
+
+def _mae(left, right):
+    return float(np.mean(np.abs(np.asarray(left) - np.asarray(right))))
+
+
+def test_rigid_recovers_a_known_rotation_and_improves_mae():
+    fixed = _phantom()
+    moving = _resample_euler(fixed, angle_deg=10.0)
+    before = _mae(fixed, moving)
+
+    result = SimpleITKRegistrar().register_complex(
+        fixed,
+        None,
+        moving,
+        None,
+        _config(transform_kind="rigid", iterations=100),
+    )
+
+    assert result.succeeded
+    assert "Euler2D" in result.transform.GetName()
+    # The moving image was produced by +10 degrees, so the inverse is -10.
+    recovered = np.degrees(result.transform.GetAngle())
+    assert recovered == pytest.approx(-10.0, abs=1.5)
+    assert _mae(fixed, result.warped_real) < before
+
+
+def test_rigid_recovers_a_known_translation_and_improves_mae():
+    fixed = _phantom()
+    moving = _resample_euler(fixed, translation=(4.0, -3.0))
+    before = _mae(fixed, moving)
+
+    result = SimpleITKRegistrar().register_complex(
+        fixed,
+        None,
+        moving,
+        None,
+        _config(transform_kind="rigid", iterations=100),
+    )
+
+    assert result.succeeded
+    translation = result.transform.GetTranslation()
+    assert translation[0] == pytest.approx(-4.0, abs=0.5)
+    assert translation[1] == pytest.approx(3.0, abs=0.5)
+    assert abs(np.degrees(result.transform.GetAngle())) < 1.0
+    assert _mae(fixed, result.warped_real) < before
+
+
+def test_affine_rotation_improves_mae():
+    fixed = _phantom()
+    moving = _resample_euler(fixed, angle_deg=10.0)
+    before = _mae(fixed, moving)
+
+    result = SimpleITKRegistrar().register_complex(
+        fixed,
+        None,
+        moving,
+        None,
+        _config(transform_kind="affine", iterations=100),
+    )
+
+    assert result.succeeded
+    assert "Affine" in result.transform.GetName()
+    assert result.warped_real.shape == fixed.shape
+    assert _mae(fixed, result.warped_real) < before
+
+
+def test_default_optimizer_stays_gradient_descent():
+    fixed = _phantom((32, 32))
+    moving = np.roll(fixed, (1, 0), axis=(0, 1))
+
+    result = SimpleITKRegistrar().register_complex(
+        fixed, None, moving, None, _config()
+    )
+
+    assert "RegularStep" not in result.stop_condition
+    assert "GradientDescent" in result.stop_condition
+
+
+def test_foreground_mask_excludes_a_zero_background():
+    image = np.zeros((30, 30))
+    image[8:14, 8:14] = np.linspace(1.0, 5.0, 36).reshape(6, 6)
+    mask = sitk.GetArrayFromImage(
+        SimpleITKRegistrar._foreground_mask(
+            sitk.GetImageFromArray(image), 80.0
+        )
+    )
+
+    assert np.all(mask[image == 0] == 0)
+    assert 0 < int(mask.sum()) < mask.size
+
+    # A phantom with no empty background still runs with the mask on.
+    # The sparse image above is only for the mask contents: its support is
+    # too small for the metric's coarse pyramid level.
+    fixed = _phantom((32, 32))
+    moving = np.roll(fixed, (1, -1), axis=(0, 1))
+    result = SimpleITKRegistrar().register_complex(
+        fixed,
+        None,
+        moving,
+        None,
+        _config(foreground_mask=True, foreground_percentile=50, iterations=10),
+    )
+    assert result.succeeded
+    assert result.config.foreground_mask is True
+
+
+def _volume_config(transform_kind):
+    return RegistrationConfig(
+        random_seed=1234,
+        iterations=10,
+        shrink_factors=(1,),
+        smoothing_sigmas=(0.0,),
+        sampling_percentage=0.2,
+        transform_kind=transform_kind,
+    )
+
+
+def test_rigid_and_affine_run_in_3d():
+    size = 12
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    fixed = np.exp(-((z - 5.0) ** 2 + (y - 6.0) ** 2 + (x - 4.0) ** 2) / 8.0)
+    moving = np.roll(fixed, (1, -1, 2), axis=(0, 1, 2))
+
+    rigid = SimpleITKRegistrar().register_complex(
+        fixed, None, moving, None, _volume_config("rigid")
+    )
+    affine = SimpleITKRegistrar().register_complex(
+        fixed, None, moving, None, _volume_config("affine")
+    )
+
+    assert rigid.succeeded
+    assert affine.succeeded
+    assert rigid.warped_real.shape == fixed.shape
+    assert affine.warped_real.shape == fixed.shape
+    assert "Euler3D" in rigid.transform.GetName()
+    assert "Affine" in affine.transform.GetName()
+
+
+def test_unknown_transform_kind_is_rejected_at_construction():
+    with pytest.raises(ValueError, match="transform_kind"):
+        RegistrationConfig(transform_kind="tps")
+
+
+def test_foreground_percentile_is_rejected_outside_0_to_100():
+    with pytest.raises(ValueError, match="foreground_percentile"):
+        RegistrationConfig(foreground_percentile=120)
 
 
 def test_execute_failure_is_reported_in_the_result():
