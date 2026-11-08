@@ -3,7 +3,7 @@ import numpy as np
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication, QProgressDialog, QWidget
 from mvc.controllers.background_work import BackgroundCall
-from mvc.models.registration import RegistrationConfig, SimpleITKRegistrar
+from mvc.models.registration import SimpleITKRegistrar, default_registration_config
 import pydicom
 from datetime import datetime
 import csv
@@ -13,8 +13,9 @@ class ThermometryController:
         """Initialize the controller with model and view references.
 
         ``registrar`` and ``registration_config`` are optional injection points
-        for tests; production code uses the SimpleITK registrar with the
-        historical default configuration.
+        for tests; production code uses the liver-respiratory preset
+        (rigid, then a coarse B-spline).  A no-argument RegistrationConfig
+        is still the historical single-stage B-spline.
         """
         self.model = model
         self.view = view
@@ -22,7 +23,7 @@ class ThermometryController:
         self.registration_config = (
             registration_config
             if registration_config is not None
-            else RegistrationConfig()
+            else default_registration_config()
         )
         self._motion_job = None
         self._motion_dialog = None
@@ -134,6 +135,7 @@ class ThermometryController:
                 moving_real=self.model.real2,
                 moving_imag=self.model.imag2,
                 config=self.registration_config,
+                spacing_mm=self._pixel_spacing(),
             )
         except Exception as exc:  # e.g. shape mismatch; keep the UI responsive
             self.model.registration_result = None
@@ -213,6 +215,7 @@ class ThermometryController:
         arrays = self._registration_arrays()
         registrar = self.registrar
         config = self.registration_config
+        spacing_mm = self._pixel_spacing()
 
         def work():
             return registrar.register_complex(
@@ -221,6 +224,7 @@ class ThermometryController:
                 moving_real=arrays[2],
                 moving_imag=arrays[3],
                 config=config,
+                spacing_mm=spacing_mm,
             )
 
         self.view.update_status("Applying motion correction...")
@@ -368,6 +372,9 @@ class ThermometryController:
             self._motion_cancelled = False
             self._motion_dialog = None
             self._wait_cursor = False
+
+    def _pixel_spacing(self):
+        return getattr(self.model, "pixel_spacing_mm", None)
 
     def _image_snapshot(self):
         return (

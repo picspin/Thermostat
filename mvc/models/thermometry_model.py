@@ -37,6 +37,8 @@ class ThermometryModel(QObject):
         # Corrected copy of the second time point (see mvc.models.registration).
         # The acquired real2/imag2 arrays are kept intact.
         self.registration_result = None
+        # SimpleITK order (column mm, row mm).  DICOM stores row first.
+        self.pixel_spacing_mm = None
         
         # 创建ROI保存目录
         self.roi_save_dir = os.path.join(os.path.expanduser("~"), ".mr_thermometry", "rois")
@@ -77,6 +79,7 @@ class ThermometryModel(QObject):
                 print("Warning: FlipAngle not found in DICOM header")
                 
             # Check if we have the minimum required parameters
+            self._remember_pixel_spacing(ds)
             if self.te is None or self.b0 is None:
                 error_msg = "Missing required DICOM parameters: "
                 if self.te is None:
@@ -92,6 +95,17 @@ class ThermometryModel(QObject):
             print(error_msg)
             self.error_occurred.emit(error_msg)
             return False
+
+    def _remember_pixel_spacing(self, ds):
+        """Store spacing for the registration grid, in SimpleITK (x, y) order."""
+        spacing = getattr(ds, "PixelSpacing", None)
+        if spacing is None or len(spacing) < 2:
+            return
+        row_mm = float(spacing[0])
+        col_mm = float(spacing[1])
+        if row_mm <= 0.0 or col_mm <= 0.0:
+            return
+        self.pixel_spacing_mm = (col_mm, row_mm)
 
     def _update_header_info(self, dicom_dataset, image_type):
         """Update DICOM header information with detailed parameter information."""

@@ -91,7 +91,7 @@ python -m pytest
 
 测试不需要显示服务器；配准模块的单元测试不依赖 Qt，模型状态测试只使用 QObject。
 
-默认运动校正仍是 SimpleITK B-spline，默认参数不变。刚体、仿射和前景 mask 可以通过 `RegistrationConfig` 显式打开，不改变默认输出。校正结果额外记录 NCC、MAE、位移和折叠比例，但这些数值不改变是否接受这次校正。界面上的运动校正在后台线程运行，取消会丢弃尚未应用的结果，不改变已经完成的配准。Cinema 只有在勾选运动校正时才配准，并且每一帧都以第一帧为参考；序列也在后台计算，取消只停止下一帧，已经算出的帧保留。另有一个必须显式启用的单病例 INR 容积校正，以及独立的低秩加稀疏分析；说明见 [docs/inr_volume_correction.md](docs/inr_volume_correction.md)。
+勾选运动校正时，默认改为刚体对齐后再做约 40 mm 网格的 B-spline，相似度是半径 4 体素的局部相关，mask 是 Otsu 组织区再膨胀 12 mm。这会改变勾选后的温度图。`RegistrationConfig()` 仍是原来的单阶段 B-spline 和 Mattes MI，需要旧结果时显式传入。没有肝脏分割模型；Otsu 不能把胸腹壁从肝脏里分开。校正结果额外记录 NCC、MAE、位移和折叠比例，但这些数值不改变是否接受这次校正。界面上的运动校正在后台线程运行，取消会丢弃尚未应用的结果，不改变已经完成的配准。Cinema 只有在勾选运动校正时才配准，并且每一帧都以第一帧为参考；序列也在后台计算，取消只停止下一帧，已经算出的帧保留。另有一个必须显式启用的单病例 INR 容积校正，以及独立的低秩加稀疏分析；说明见 [docs/inr_volume_correction.md](docs/inr_volume_correction.md)。
 
 推送和拉取请求会运行 `.github/workflows/tests.yml`：安装依赖、`compileall` 和 `pytest`。它不启动图形界面。
 
