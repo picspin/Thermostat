@@ -54,9 +54,12 @@ class RegistrationConfig:
         transform_kind: ``"bspline"`` (historical default), ``"rigid"`` or
             ``"affine"``.  The default UI path stays B-spline.
         foreground_mask: When true, the metric samples only voxels at or
-            above ``foreground_percentile``.  The default is off, so the
-            historical sampling is unchanged.
-        foreground_percentile: Percentile used to build that mask.
+            above ``foreground_percentile`` of the non-background signal.
+            The default is off, so the historical sampling is unchanged.
+        foreground_percentile: Percentile of the signal used to build that
+            mask.  Background near zero is excluded before the percentile
+            is computed, otherwise a mostly empty MR image makes the mask
+            cover every voxel.
     """
 
     metric: str = "mattes_mi"
@@ -76,6 +79,19 @@ class RegistrationConfig:
     transform_kind: str = "bspline"
     foreground_mask: bool = False
     foreground_percentile: float = 80.0
+
+    def __post_init__(self):
+        allowed = ("bspline", "rigid", "affine")
+        if self.transform_kind not in allowed:
+            raise ValueError(
+                "Unsupported transform_kind: "
+                f"{self.transform_kind!r}. Expected one of {allowed}."
+            )
+        if not 0.0 <= float(self.foreground_percentile) <= 100.0:
+            raise ValueError(
+                "foreground_percentile must be between 0 and 100, "
+                f"got {self.foreground_percentile!r}"
+            )
 
 
 @dataclass
@@ -118,10 +134,12 @@ class RegistrationResult:
 class SimpleITKRegistrar:
     """SimpleITK registrar for 2D/3D motion correction.
 
-    The default transform is the historical B-spline.  Rigid and affine are
-    opt-in through ``RegistrationConfig.transform_kind`` and do not change
-    that default.  The transform is estimated from the real component and
-    then applied to both real and imaginary components.
+    The default transform is the historical B-spline, optimized with
+    gradient descent.  Rigid and affine are opt-in.  They are initialized
+    at the image center and optimized with regular-step gradient descent,
+    because the B-spline step size does not recover rotation.  That choice
+    does not change the default B-spline path.  The transform is estimated
+    from the real component and then applied to both components.
     """
 
     _METRIC_NAMES = {
@@ -246,13 +264,19 @@ class SimpleITKRegistrar:
                 method, fixed_image, moving_image, config
             )
 
-        transform = self._initial_transform(fixed_image, config)
-        method.SetInitialTransform(transform)
+        transform = self._initial_transform(fixed_image, moving_image, config)
+        # B-spline keeps the historical in-place flag (false).  Rigid and
+        # affine must be updated in place so the centered parameters are the
+        # ones returned to the caller.
+        if config.transform_kind == "bspline":
+            method.SetInitialTransform(transform)
+        else:
+            method.SetInitialTransform(transform, True)
 
         final_transform = method.Execute(fixed_image, moving_image)
         return final_transform, method
 
-    def _initial_transform(self, fixed_image, config):
+    def _initial_transform(self, fixed_image, moving_image, config):
         """Initial transform.  The default kind is still a B-spline."""
         kind = config.transform_kind
         dimension = fixed_image.GetDimension()
@@ -261,19 +285,29 @@ class SimpleITKRegistrar:
             return sitk.BSplineTransformInitializer(fixed_image, mesh_size)
         if kind == "rigid":
             if dimension == 2:
-                return sitk.Euler2DTransform()
-            if dimension == 3:
-                return sitk.Euler3DTransform()
-            raise ValueError(
-                f"rigid registration does not support dimension {dimension}"
-            )
-        if kind == "affine":
-            if dimension in (2, 3):
-                return sitk.AffineTransform(dimension)
-            raise ValueError(
-                f"affine registration does not support dimension {dimension}"
-            )
-        raise ValueError(f"Unsupported transform_kind: {kind!r}")
+                transform = sitk.Euler2DTransform()
+            elif dimension == 3:
+                transform = sitk.Euler3DTransform()
+            else:
+                raise ValueError(
+                    "rigid registration does not support "
+                    f"dimension {dimension}"
+                )
+        elif kind == "affine":
+            if dimension not in (2, 3):
+                raise ValueError(
+                    "affine registration does not support "
+                    f"dimension {dimension}"
+                )
+            transform = sitk.AffineTransform(dimension)
+        else:
+            raise ValueError(f"Unsupported transform_kind: {kind!r}")
+        return sitk.CenteredTransformInitializer(
+            fixed_image,
+            moving_image,
+            transform,
+            sitk.CenteredTransformInitializerFilter.GEOMETRY,
+        )
 
     def _configure_foreground_mask(self, method, fixed_image, moving_image, config):
         method.SetMetricFixedMask(
@@ -289,10 +323,18 @@ class SimpleITKRegistrar:
         finite = array[np.isfinite(array)]
         if finite.size == 0:
             raise ValueError("foreground mask needs a finite image")
-        threshold = float(np.percentile(finite, float(percentile)))
-        upper = float(np.max(finite))
-        if threshold > upper:
-            threshold = upper
+        # A percentile of the whole image is a no-op when most voxels are
+        # background: the 80th percentile of a 90% zero image is still zero,
+        # and the mask then includes every voxel.
+        peak = float(np.max(finite))
+        if peak > 0.0:
+            signal = finite[finite > peak * 1e-6]
+        else:
+            signal = finite
+        if signal.size == 0:
+            signal = finite
+        threshold = float(np.percentile(signal, float(percentile)))
+        upper = float(np.max(signal))
         mask = sitk.BinaryThreshold(
             image,
             lowerThreshold=threshold,
@@ -321,12 +363,26 @@ class SimpleITKRegistrar:
             )
 
     def _configure_optimizer(self, method, config):
-        method.SetOptimizerAsGradientDescent(
-            learningRate=float(config.learning_rate),
-            numberOfIterations=int(config.iterations),
-            convergenceMinimumValue=float(config.convergence_min_value),
-            convergenceWindowSize=int(config.convergence_window),
-        )
+        if config.transform_kind == "bspline":
+            # Historical optimizer.  Do not change this for the default path.
+            method.SetOptimizerAsGradientDescent(
+                learningRate=float(config.learning_rate),
+                numberOfIterations=int(config.iterations),
+                convergenceMinimumValue=float(config.convergence_min_value),
+                convergenceWindowSize=int(config.convergence_window),
+            )
+        else:
+            # Gradient descent with the B-spline step recovers a rigid
+            # rotation with the wrong translation and a worse MAE.  Regular
+            # step stays inside the overlap and reaches the known angle.
+            learning_rate = float(config.learning_rate)
+            method.SetOptimizerAsRegularStepGradientDescent(
+                learningRate=learning_rate,
+                minStep=min(1e-4, abs(learning_rate) * 1e-4),
+                numberOfIterations=int(config.iterations),
+                relaxationFactor=0.5,
+                gradientMagnitudeTolerance=float(config.convergence_min_value),
+            )
         method.SetOptimizerScalesFromPhysicalShift()
 
     def _configure_pyramid(self, method, config):
