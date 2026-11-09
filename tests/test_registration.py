@@ -10,6 +10,7 @@ from mvc.models.registration import (
     _magnitude_max,
     _magnitude_rms,
     _ncc,
+    default_registration_config,
 )
 
 
@@ -323,6 +324,82 @@ def test_unknown_transform_kind_is_rejected_at_construction():
         RegistrationConfig(transform_kind="tps")
 
 
+def test_liver_preset_is_the_checkbox_configuration():
+    config = default_registration_config()
+
+    assert config is not None
+    assert config.transform_kind == "rigid_bspline"
+    assert config.metric == "ants_neighborhood_correlation"
+    assert config.neighborhood_radius == 4
+    assert config.mask_kind == "otsu_dilated"
+    assert config.dilation_mm == 12.0
+    assert config.bspline_grid_spacing_mm == 40.0
+    # The no-argument config stays the historical single stage.
+    assert RegistrationConfig().transform_kind == "bspline"
+    assert RegistrationConfig().metric == "mattes_mi"
+    assert RegistrationConfig().mask_kind == "none"
+
+
+def test_otsu_mask_drops_distant_air_and_dilates():
+    image = np.zeros((40, 40))
+    image[10:16, 10:16] = 8.0
+    sitk_image = sitk.GetImageFromArray(image)
+    sitk_image.SetSpacing((2.0, 2.0))
+    mask = sitk.GetArrayFromImage(
+        SimpleITKRegistrar()._otsu_dilated_mask(sitk_image, radius_mm=4.0)
+    )
+
+    assert mask[12, 12] == 1
+    assert mask[9, 12] == 1  # one 2 mm voxel outside, inside the 4 mm rim
+    assert mask[0, 0] == 0
+
+
+def test_cascade_recovers_a_translation():
+    fixed = _phantom((40, 40))
+    moving = _resample_euler(fixed, translation=(4.0, -3.0))
+    before = _mae(fixed, moving)
+    config = RegistrationConfig(
+        random_seed=1234,
+        iterations=20,
+        shrink_factors=(2, 1),
+        smoothing_sigmas=(0.0, 0.0),
+        sampling_percentage=0.4,
+        metric="mattes_mi",
+        transform_kind="rigid_bspline",
+        bspline_grid_spacing_mm=20.0,
+    )
+
+    result = SimpleITKRegistrar().register_complex(
+        fixed, None, moving, None, config, spacing_mm=(1.0, 1.0)
+    )
+
+    assert result.succeeded
+    assert "Composite" in result.transform.GetName()
+    assert _mae(fixed, result.warped_real) < before
+
+
+def test_local_correlation_rigid_runs():
+    fixed = _phantom((32, 32))
+    moving = _resample_euler(fixed, translation=(2.0, -1.0))
+
+    result = SimpleITKRegistrar().register_complex(
+        fixed,
+        None,
+        moving,
+        None,
+        _config(
+            metric="ants_neighborhood_correlation",
+            neighborhood_radius=2,
+            transform_kind="rigid",
+            iterations=15,
+        ),
+    )
+
+    assert result.succeeded
+    assert result.metric_name == "ANTSNeighborhoodCorrelation"
+    assert _mae(fixed, result.warped_real) < _mae(fixed, moving)
+
+
 def test_foreground_percentile_is_rejected_outside_0_to_100():
     with pytest.raises(ValueError, match="foreground_percentile"):
         RegistrationConfig(foreground_percentile=120)
@@ -343,3 +420,17 @@ def test_execute_failure_is_reported_in_the_result():
     assert result.warped_real is None
     assert result.warped_imag is None
     assert "simulated registration failure" in result.message
+
+
+def test_dicom_spacing_is_stored_as_x_then_y():
+    from mvc.models.thermometry_model import ThermometryModel
+
+    model = ThermometryModel.__new__(ThermometryModel)
+    model.pixel_spacing_mm = None
+
+    class Header:
+        PixelSpacing = [1.5, 2.0]
+
+    model._remember_pixel_spacing(Header())
+
+    assert model.pixel_spacing_mm == (2.0, 1.5)
