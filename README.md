@@ -1,4 +1,5 @@
-# MR热统计系统 (MR Thermostat System) Author: Xiaolei Zhu, zxl1412@gmail.com  
+# MR热统计系统 (MR Thermostat System)  
+> Author: Xiaolei Zhu, zxl1412@gmail.com  
 
 MR热统计系统是一个用于磁共振成像（MRI）热图分析的Python应用程序，可以从DICOM图像计算组织温度变化。
 
