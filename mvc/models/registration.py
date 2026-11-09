@@ -5,16 +5,16 @@ with plain numpy arrays in headless tests.  The controller is responsible for
 deciding what to do with the result and the model is responsible for keeping
 the original acquired images intact.
 
-The defaults mirror the historical controller configuration so that the
-extraction in this change is behavior preserving.  Algorithmic defaults will
-be revisited separately once the motion model / similarity metric / reference
-frame have been agreed on.
+``RegistrationConfig()`` is still the historical single-stage B-spline with
+Mattes MI.  The motion-correction checkbox uses
+``RegistrationConfig.liver_respiratory()`` instead: rigid, then a coarse
+B-spline, with local correlation and an Otsu mask.
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional, Tuple
 
 import numpy as np
@@ -32,7 +32,8 @@ class RegistrationConfig:
     """Parameters for the SimpleITK registration.
 
     Attributes:
-        metric: ``"mattes_mi"`` (historical default) or ``"correlation"``.
+        metric: ``"mattes_mi"`` (historical), ``"correlation"``, or
+            ``"ants_neighborhood_correlation"`` (local NCC).
         histogram_bins: Number of histogram bins for Mattes MI.
         sampling_percentage: Fraction of pixels sampled by the metric.
         random_seed: Seed for random sampling.  ``None`` keeps SimpleITK's
@@ -51,15 +52,20 @@ class RegistrationConfig:
             ``transform_kind="bspline"``.
         interpolator: ``"linear"``, ``"nearest"`` or ``"bspline"``.
         dice_warning_threshold: DICE below this value produces a warning.
-        transform_kind: ``"bspline"`` (historical default), ``"rigid"`` or
-            ``"affine"``.  The default UI path stays B-spline.
-        foreground_mask: When true, the metric samples only voxels at or
-            above ``foreground_percentile`` of the non-background signal.
-            The default is off, so the historical sampling is unchanged.
-        foreground_percentile: Percentile of the signal used to build that
-            mask.  Background near zero is excluded before the percentile
-            is computed, otherwise a mostly empty MR image makes the mask
-            cover every voxel.
+        transform_kind: ``"bspline"`` (historical), ``"rigid"``, ``"affine"``,
+            or ``"rigid_bspline"`` (rigid stage, then a B-spline).
+        foreground_mask: When true, and ``mask_kind`` is ``"none"``, the
+            metric uses the percentile mask.  The historical default is off.
+        foreground_percentile: Percentile of the non-background signal used
+            by that mask.
+        neighborhood_radius: Voxel radius for local NCC.  Ignored by the
+            other metrics.  4 is inside the requested 3–5 voxel range.
+        mask_kind: ``"none"``, ``"percentile"``, or ``"otsu_dilated"``.
+            The dilated Otsu mask is a coarse tissue mask, not a liver
+            segmentation.  It drops air and adds a rim around the tissue.
+        dilation_mm: Physical radius of that dilation.
+        bspline_grid_spacing_mm: When set, the B-spline mesh is sized from
+            the image's physical extent.  ``None`` keeps ``mesh_size``.
     """
 
     metric: str = "mattes_mi"
@@ -79,19 +85,66 @@ class RegistrationConfig:
     transform_kind: str = "bspline"
     foreground_mask: bool = False
     foreground_percentile: float = 80.0
+    neighborhood_radius: int = 4
+    mask_kind: str = "none"
+    dilation_mm: float = 12.0
+    bspline_grid_spacing_mm: Optional[float] = None
 
     def __post_init__(self):
-        allowed = ("bspline", "rigid", "affine")
-        if self.transform_kind not in allowed:
+        transforms = ("bspline", "rigid", "affine", "rigid_bspline")
+        if self.transform_kind not in transforms:
             raise ValueError(
                 "Unsupported transform_kind: "
-                f"{self.transform_kind!r}. Expected one of {allowed}."
+                f"{self.transform_kind!r}. Expected one of {transforms}."
+            )
+        masks = ("none", "percentile", "otsu_dilated")
+        if self.mask_kind not in masks:
+            raise ValueError(
+                f"Unsupported mask_kind: {self.mask_kind!r}. "
+                f"Expected one of {masks}."
             )
         if not 0.0 <= float(self.foreground_percentile) <= 100.0:
             raise ValueError(
                 "foreground_percentile must be between 0 and 100, "
                 f"got {self.foreground_percentile!r}"
             )
+        if int(self.neighborhood_radius) < 1:
+            raise ValueError(
+                "neighborhood_radius must be at least 1, "
+                f"got {self.neighborhood_radius!r}"
+            )
+        if self.bspline_grid_spacing_mm is not None:
+            if float(self.bspline_grid_spacing_mm) <= 0.0:
+                raise ValueError(
+                    "bspline_grid_spacing_mm must be positive, "
+                    f"got {self.bspline_grid_spacing_mm!r}"
+                )
+
+    @classmethod
+    def liver_respiratory(cls) -> "RegistrationConfig":
+        """Checkbox preset for same-sequence respiratory motion.
+
+        Stage 1 is rigid, not affine: without a true liver mask, affine
+        shear follows the abdominal wall.  Stage 2 is a B-spline whose
+        cells are about 40 mm, inside the requested 35–45 mm range.
+        Local NCC uses a 4-voxel radius.  The mask is Otsu plus a 12 mm
+        dilation, inside the requested 10–15 mm range.  SimpleITK has no
+        bending-energy metric, so the coarse grid is the regularizer.
+        """
+        return cls(
+            metric="ants_neighborhood_correlation",
+            neighborhood_radius=4,
+            transform_kind="rigid_bspline",
+            mask_kind="otsu_dilated",
+            dilation_mm=12.0,
+            bspline_grid_spacing_mm=40.0,
+            histogram_bins=32,
+        )
+
+
+def default_registration_config() -> RegistrationConfig:
+    """Configuration used when the user turns motion correction on."""
+    return RegistrationConfig.liver_respiratory()
 
 
 @dataclass
@@ -145,6 +198,7 @@ class SimpleITKRegistrar:
     _METRIC_NAMES = {
         "mattes_mi": "MattesMutualInformation",
         "correlation": "Correlation",
+        "ants_neighborhood_correlation": "ANTSNeighborhoodCorrelation",
     }
 
     _INTERPOLATORS = {
@@ -160,6 +214,7 @@ class SimpleITKRegistrar:
         moving_real: np.ndarray,
         moving_imag: Optional[np.ndarray],
         config: Optional[RegistrationConfig] = None,
+        spacing_mm: Optional[Tuple[float, ...]] = None,
     ) -> RegistrationResult:
         """Register ``moving_real`` to ``fixed_real`` and warp both components.
 
@@ -182,6 +237,8 @@ class SimpleITKRegistrar:
         try:
             fixed_image = sitk.GetImageFromArray(fixed_array)
             moving_image = sitk.GetImageFromArray(moving_array)
+            _assign_spacing(fixed_image, spacing_mm)
+            _assign_spacing(moving_image, spacing_mm)
 
             final_transform, method = self._execute(
                 fixed_image, moving_image, config
@@ -194,6 +251,7 @@ class SimpleITKRegistrar:
             warped_imag = None
             if moving_imag is not None:
                 moving_imag_image = sitk.GetImageFromArray(np.asarray(moving_imag))
+                _assign_spacing(moving_imag_image, spacing_mm)
                 warped_imag = self._resample(
                     moving_imag_image, fixed_image, final_transform, interpolator
                 )
@@ -211,6 +269,8 @@ class SimpleITKRegistrar:
             else:
                 status = STATUS_OK
                 message = ""
+            if config.transform_kind == "rigid_bspline" and not message:
+                message = "rigid then coarse bspline"
 
             return RegistrationResult(
                 warped_real=warped_real,
@@ -252,19 +312,26 @@ class SimpleITKRegistrar:
     # ------------------------------------------------------------------
     # SimpleITK configuration
     # ------------------------------------------------------------------
-    def _execute(self, fixed_image, moving_image, config):
-        """Build and run the registration; returns (transform, method)."""
+    def _execute(
+        self,
+        fixed_image,
+        moving_image,
+        config,
+        moving_initial_transform=None,
+    ):
+        """Build and run one stage; returns (transform, method)."""
+        if config.transform_kind == "rigid_bspline":
+            return self._execute_cascade(fixed_image, moving_image, config)
         method = sitk.ImageRegistrationMethod()
         self._configure_metric(method, config)
         self._configure_optimizer(method, config)
         self._configure_pyramid(method, config)
         method.SetInterpolator(self._interpolator(config.interpolator))
-        if config.foreground_mask:
-            self._configure_foreground_mask(
-                method, fixed_image, moving_image, config
-            )
+        self._configure_mask(method, fixed_image, moving_image, config)
 
         transform = self._initial_transform(fixed_image, moving_image, config)
+        if moving_initial_transform is not None:
+            method.SetMovingInitialTransform(moving_initial_transform)
         # B-spline keeps the historical in-place flag (false).  Rigid and
         # affine must be updated in place so the centered parameters are the
         # ones returned to the caller.
@@ -276,13 +343,31 @@ class SimpleITKRegistrar:
         final_transform = method.Execute(fixed_image, moving_image)
         return final_transform, method
 
+    def _execute_cascade(self, fixed_image, moving_image, config):
+        """Rigid alignment, then a B-spline on that result."""
+        rigid_tx, _ = self._execute(
+            fixed_image,
+            moving_image,
+            replace(config, transform_kind="rigid"),
+        )
+        bspline_tx, method = self._execute(
+            fixed_image,
+            moving_image,
+            replace(config, transform_kind="bspline"),
+            moving_initial_transform=rigid_tx,
+        )
+        composite = sitk.CompositeTransform(fixed_image.GetDimension())
+        composite.AddTransform(rigid_tx)
+        composite.AddTransform(bspline_tx)
+        return composite, method
+
     def _initial_transform(self, fixed_image, moving_image, config):
         """Initial transform.  The default kind is still a B-spline."""
         kind = config.transform_kind
         dimension = fixed_image.GetDimension()
         if kind == "bspline":
-            mesh_size = [int(config.mesh_size)] * dimension
-            return sitk.BSplineTransformInitializer(fixed_image, mesh_size)
+            mesh = self._bspline_mesh(fixed_image, config)
+            return sitk.BSplineTransformInitializer(fixed_image, mesh)
         if kind == "rigid":
             if dimension == 2:
                 transform = sitk.Euler2DTransform()
@@ -309,13 +394,51 @@ class SimpleITKRegistrar:
             sitk.CenteredTransformInitializerFilter.GEOMETRY,
         )
 
-    def _configure_foreground_mask(self, method, fixed_image, moving_image, config):
-        method.SetMetricFixedMask(
-            self._foreground_mask(fixed_image, config.foreground_percentile)
-        )
-        method.SetMetricMovingMask(
-            self._foreground_mask(moving_image, config.foreground_percentile)
-        )
+    def _bspline_mesh(self, image, config):
+        if config.bspline_grid_spacing_mm is None:
+            return [int(config.mesh_size)] * image.GetDimension()
+        mesh = []
+        step_mm = float(config.bspline_grid_spacing_mm)
+        for length, spacing in zip(
+            image.GetSize(), image.GetSpacing(), strict=True
+        ):
+            physical = float(length) * float(spacing)
+            mesh.append(max(1, int(round(physical / step_mm))))
+        return mesh
+
+    def _configure_mask(self, method, fixed_image, moving_image, config):
+        kind = _active_mask_kind(config)
+        if kind == "none":
+            return
+        if kind == "percentile":
+            fixed_mask = self._foreground_mask(
+                fixed_image, config.foreground_percentile
+            )
+            moving_mask = self._foreground_mask(
+                moving_image, config.foreground_percentile
+            )
+        else:
+            fixed_mask = self._otsu_dilated_mask(fixed_image, config.dilation_mm)
+            moving_mask = self._otsu_dilated_mask(
+                moving_image, config.dilation_mm
+            )
+        method.SetMetricFixedMask(fixed_mask)
+        method.SetMetricMovingMask(moving_mask)
+
+    def _otsu_dilated_mask(self, image, radius_mm):
+        """Coarse tissue mask: Otsu, then a physical dilation.
+
+        This is not a liver segmentation.  Bright chest wall stays inside
+        the Otsu foreground.  The dilation only adds a rim so the diaphragm
+        next to the tissue is not cut off.
+        """
+        mask = sitk.OtsuThreshold(image, 0, 1)
+        radius = [
+            max(1, int(round(float(radius_mm) / float(step))))
+            for step in image.GetSpacing()
+        ]
+        dilated = sitk.BinaryDilate(mask, radius)
+        return sitk.Cast(dilated, sitk.sitkUInt8)
 
     @staticmethod
     def _foreground_mask(image, percentile):
@@ -351,6 +474,10 @@ class SimpleITKRegistrar:
             )
         elif config.metric == "correlation":
             method.SetMetricAsCorrelation()
+        elif config.metric == "ants_neighborhood_correlation":
+            method.SetMetricAsANTSNeighborhoodCorrelation(
+                radius=int(config.neighborhood_radius)
+            )
         else:
             raise ValueError(f"Unsupported metric: {config.metric!r}")
 
@@ -433,6 +560,26 @@ class SimpleITKRegistrar:
         overlap = sitk.LabelOverlapMeasuresImageFilter()
         overlap.Execute(fixed_binary, moving_binary)
         return float(overlap.GetDiceCoefficient())
+
+
+def _active_mask_kind(config):
+    if config.mask_kind == "otsu_dilated":
+        return "otsu_dilated"
+    if config.mask_kind == "percentile" or config.foreground_mask:
+        return "percentile"
+    return "none"
+
+
+def _assign_spacing(image, spacing_mm):
+    if spacing_mm is None:
+        return
+    values = tuple(float(value) for value in spacing_mm)
+    if len(values) != image.GetDimension():
+        raise ValueError(
+            "spacing_mm has "
+            f"{len(values)} values for a {image.GetDimension()}D image"
+        )
+    image.SetSpacing(values)
 
 
 def _similarity_diagnostics(fixed, moving, warped, transform, reference_image):

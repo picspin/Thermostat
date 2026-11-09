@@ -117,6 +117,9 @@ class CinemaModel(QObject):
                         moving_real=self.thermometry_model.real2,
                         moving_imag=self.thermometry_model.imag2,
                         config=registration_config,
+                        spacing_mm=getattr(
+                            self.thermometry_model, "pixel_spacing_mm", None
+                        ),
                     )
                     if result.status == "failed" or result.warped_real is None:
                         self.temperature_sequence.append(None)
