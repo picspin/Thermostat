@@ -8,6 +8,7 @@ import os
 import cv2
 from datetime import datetime
 import gc
+from mvc.models.registration import RegistrationConfig, SimpleITKRegistrar
 
 class CinemaModel(QObject):
     """Model for generating temperature map sequence movies."""
@@ -33,9 +34,18 @@ class CinemaModel(QObject):
         When it is on, every later frame is registered to the first frame and
         the corrected copy is used for that pair only.  Consecutive-pair
         registration is intentionally not the default: its error would
+        Motion correction is off unless ``apply_motion_correction`` is passed.
+        When it is on, every later frame is registered to the first frame and
+        the corrected copy is used for that pair only.  Consecutive-pair
+        registration is intentionally not the default: its error would
         accumulate along the sequence.  A frame whose images fail to load, or
         whose registration fails, is stored as ``None``.  The previous frame
         is not reused, and earlier results are left unchanged.
+
+        When no registrar is given, a ``SimpleITKRegistrar`` is created
+        automatically with the ``liver_respiratory`` preset.  That is the
+        same default the single-case checkbox uses.  Callers that need the
+        old single-stage Mattes MI B-spline must pass it explicitly.
 
         ``stop_event`` is optional.  When it is set, the loop stops before
         the next frame.  The frame already in progress finishes, and frames
@@ -52,10 +62,9 @@ class CinemaModel(QObject):
         total_pairs = len(real_files) - 1
         
         if apply_motion_correction and registrar is None:
-            self.error_occurred.emit(
-                "Motion correction for a sequence needs an explicit registrar"
-            )
-            return None
+            registrar = SimpleITKRegistrar()
+            if registration_config is None:
+                registration_config = RegistrationConfig.liver_respiratory()
 
         # With motion correction the fixed image is always the first frame.
         # It is loaded once.  Registering each frame to the previous frame

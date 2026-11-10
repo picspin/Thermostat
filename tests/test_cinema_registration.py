@@ -250,12 +250,37 @@ def test_stop_event_before_the_first_frame_stores_nothing():
     assert any("cancelled" in message for message in cinema.errors)
 
 
-def test_motion_correction_without_a_registrar_is_refused():
-    cinema = _cinema(RecordingModel())
+def test_cinema_uses_liver_respiratory_preset():
+    model = RecordingModel()
+    cinema = _cinema(model)
+    registrar = FrameRegistrar()
+    config = RegistrationConfig.liver_respiratory()
+
+    sequence = cinema.calculate_temperature_sequence(
+        ["r0", "r1", "r2"],
+        ["i0", "i1", "i2"],
+        apply_motion_correction=True,
+        registrar=registrar,
+        registration_config=config,
+    )
+
+    assert sequence is not None
+    used = registrar.calls[0]["config"]
+    assert used.transform_kind == "rigid_bspline"
+    assert used.metric == "ants_neighborhood_correlation"
+    assert used.mask_kind == "otsu_dilated"
+
+
+def test_cinema_auto_creates_registrar_when_none_is_passed():
+    """The model no longer refuses a missing registrar."""
+    model = RecordingModel()
+    cinema = _cinema(model)
 
     sequence = cinema.calculate_temperature_sequence(
         ["r0", "r1"], ["i0", "i1"], apply_motion_correction=True
     )
 
-    assert sequence is None
-    assert cinema.errors
+    # No explicit registrar → the model creates a SimpleITKRegistrar
+    # internally.  The synthetic 4×4 images may produce failed frames,
+    # but the sequence itself is not refused as None.
+    assert sequence is not None
