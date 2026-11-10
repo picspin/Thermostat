@@ -324,7 +324,14 @@ class SimpleITKRegistrar:
             return self._execute_cascade(fixed_image, moving_image, config)
         method = sitk.ImageRegistrationMethod()
         self._configure_metric(method, config)
-        self._configure_optimizer(method, config)
+        # The historical single-stage B-spline keeps gradient descent.
+        # The second stage of a rigid-then-B-spline cascade starts from an
+        # alignment that is already close, and that same step size overshoots.
+        self._configure_optimizer(
+            method,
+            config,
+            regular_step=moving_initial_transform is not None,
+        )
         self._configure_pyramid(method, config)
         method.SetInterpolator(self._interpolator(config.interpolator))
         self._configure_mask(method, fixed_image, moving_image, config)
@@ -489,9 +496,9 @@ class SimpleITKRegistrar:
                 float(config.sampling_percentage), int(config.random_seed)
             )
 
-    def _configure_optimizer(self, method, config):
-        if config.transform_kind == "bspline":
-            # Historical optimizer.  Do not change this for the default path.
+    def _configure_optimizer(self, method, config, regular_step=False):
+        if config.transform_kind == "bspline" and not regular_step:
+            # Historical optimizer.  Do not change this for a lone B-spline.
             method.SetOptimizerAsGradientDescent(
                 learningRate=float(config.learning_rate),
                 numberOfIterations=int(config.iterations),
@@ -552,6 +559,9 @@ class SimpleITKRegistrar:
             upperThreshold=float(np.max(fixed_array)),
         )
         warped_image = sitk.GetImageFromArray(warped_array)
+        # GetImageFromArray defaults to spacing 1.  The fixed image may
+        # carry DICOM spacing, and the overlap filter rejects that mismatch.
+        warped_image.CopyInformation(fixed_image)
         moving_binary = sitk.BinaryThreshold(
             warped_image,
             lowerThreshold=float(np.mean(warped_array)),

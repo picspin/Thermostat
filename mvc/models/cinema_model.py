@@ -10,6 +10,36 @@ from datetime import datetime
 import gc
 from mvc.models.registration import RegistrationConfig, SimpleITKRegistrar
 
+def _reject_registration(result):
+    """Return a short reason to drop a frame, or None to keep the warp.
+
+    A warning that still increases the error, or a folded warp, is not a
+    usable correction.  The raw ITK text stays in the log, not the signal.
+    """
+    if result.status == "failed" or result.warped_real is None:
+        return _short_registration_failure(result.message)
+    if (
+        np.isfinite(result.mae_before)
+        and np.isfinite(result.mae_after)
+        and result.mae_after > result.mae_before
+    ):
+        return "the warp increased the image error"
+    if np.isfinite(result.folding_ratio) and result.folding_ratio > 0.05:
+        return "the warp folded the image"
+    return None
+
+
+def _short_registration_failure(message):
+    text = message or "registration failed"
+    if "physical space" in text:
+        return "the overlap check saw inconsistent image spacing"
+    if "VirtualSampledPointSet" in text:
+        return "the similarity metric had no usable samples"
+    if "ITK ERROR" in text or "/tmp/" in text or len(text) > 160:
+        return "registration failed"
+    return text
+
+
 class CinemaModel(QObject):
     """Model for generating temperature map sequence movies."""
     
@@ -34,18 +64,17 @@ class CinemaModel(QObject):
         When it is on, every later frame is registered to the first frame and
         the corrected copy is used for that pair only.  Consecutive-pair
         registration is intentionally not the default: its error would
-        Motion correction is off unless ``apply_motion_correction`` is passed.
-        When it is on, every later frame is registered to the first frame and
-        the corrected copy is used for that pair only.  Consecutive-pair
-        registration is intentionally not the default: its error would
         accumulate along the sequence.  A frame whose images fail to load, or
-        whose registration fails, is stored as ``None``.  The previous frame
-        is not reused, and earlier results are left unchanged.
+        whose registration fails or makes the image worse, is stored as
+        ``None``.  The previous frame is not reused, and earlier results are
+        left unchanged.
 
-        When no registrar is given, a ``SimpleITKRegistrar`` is created
-        automatically with the ``liver_respiratory`` preset.  That is the
-        same default the single-case checkbox uses.  Callers that need the
-        old single-stage Mattes MI B-spline must pass it explicitly.
+        If ``registrar`` is omitted, a ``SimpleITKRegistrar`` is created here.
+        If ``registration_config`` is also omitted, that registrar uses
+        ``RegistrationConfig.liver_respiratory()``, the same preset as the
+        single-case checkbox.  A caller that passes its own registrar and no
+        config still gets the historical single-stage Mattes MI B-spline,
+        because that default lives on ``register_complex``.
 
         ``stop_event`` is optional.  When it is set, the loop stops before
         the next frame.  The frame already in progress finishes, and frames
@@ -130,11 +159,16 @@ class CinemaModel(QObject):
                             self.thermometry_model, "pixel_spacing_mm", None
                         ),
                     )
-                    if result.status == "failed" or result.warped_real is None:
+                    rejection = _reject_registration(result)
+                    if rejection is not None:
                         self.temperature_sequence.append(None)
+                        print(
+                            "Motion correction failed for frame "
+                            f"{moving_index + 1}: {result.message}"
+                        )
                         self.error_occurred.emit(
                             f"Motion correction failed for frame {moving_index + 1}: "
-                            f"{result.message}"
+                            f"{rejection}"
                         )
                         continue
                     self.thermometry_model.registration_result = result
