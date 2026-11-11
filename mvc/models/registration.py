@@ -8,7 +8,8 @@ the original acquired images intact.
 ``RegistrationConfig()`` is still the historical single-stage B-spline with
 Mattes MI.  The motion-correction checkbox uses
 ``RegistrationConfig.liver_respiratory()`` instead: rigid, then a coarse
-B-spline, with local correlation and an Otsu mask.
+B-spline, with local correlation and an Otsu mask.  ``metric="mind"`` is an
+explicit extra similarity.  Neither default selects it.
 """
 
 from __future__ import annotations
@@ -19,6 +20,12 @@ from typing import Any, Optional, Tuple
 
 import numpy as np
 import SimpleITK as sitk
+
+from mvc.models.mind import (
+    MIND_RADIUS,
+    MIND_SAMPLE_STRIDE,
+    optimize_mind,
+)
 
 
 # Public status values for RegistrationResult.status.
@@ -32,8 +39,13 @@ class RegistrationConfig:
     """Parameters for the SimpleITK registration.
 
     Attributes:
-        metric: ``"mattes_mi"`` (historical), ``"correlation"``, or
-            ``"ants_neighborhood_correlation"`` (local NCC).
+        metric: ``"mattes_mi"`` (historical), ``"correlation"``,
+            ``"ants_neighborhood_correlation"`` (local NCC), or ``"mind"``.
+            MIND is opt-in.  The no-argument config and
+            ``liver_respiratory()`` do not select it.  MIND does not use
+            the Mattes learning rate, histogram, pyramid, or random
+            sampling percentage; those fields stay in force for the other
+            metrics.
         histogram_bins: Number of histogram bins for Mattes MI.
         sampling_percentage: Fraction of pixels sampled by the metric.
         random_seed: Seed for random sampling.  ``None`` keeps SimpleITK's
@@ -42,7 +54,15 @@ class RegistrationConfig:
             reproducible.
         learning_rate: Gradient-descent learning rate.
         iterations: Maximum optimizer iterations per resolution level.
-        convergence_min_value: Convergence checker minimum value.
+            MIND has no pyramid.  For a rigid or affine MIND stage the
+            translation warm-up may use at most half of this budget
+            (rounded down) and the full solve gets the rest, so the
+            reported iteration count does not exceed it.  A MIND B-spline
+            spends the whole budget on its one solve.  A cascade still
+            runs one budget per stage, matching the other metrics.
+        convergence_min_value: Convergence checker minimum value.  MIND
+            passes it to L-BFGS-B as both ``ftol`` and ``gtol`` (the
+            projected-gradient tolerance, Fortran's ``pgtol``).
         convergence_window: Convergence checker window size.
         shrink_factors: Shrink factors per resolution level.
         smoothing_sigmas: Smoothing sigmas per resolution level.
@@ -66,6 +86,24 @@ class RegistrationConfig:
         dilation_mm: Physical radius of that dilation.
         bspline_grid_spacing_mm: When set, the B-spline mesh is sized from
             the image's physical extent.  ``None`` keeps ``mesh_size``.
+        mind_radius: Chebyshev radius of the MIND stencil.  Ignored unless
+            ``metric="mind"``.  1 is the 8-neighbourhood in 2D and the
+            26-neighbourhood in 3D.  A larger radius stops being a small
+            neighbourhood and mixes tissue that a one-voxel shift should
+            keep distinct.  Global intensity offsets cancel inside that
+            stencil, which is the reason to prefer MIND over sum of squares.
+        mind_sample_stride: Voxel stride of the MIND lattice.  Ignored
+            unless ``metric="mind"``.  2 keeps one sample inside each
+            interior radius-1 stencil.  The lattice is inset by the radius,
+            so the high-index edge can sit outside every stencil.  A stride
+            larger than ``2 * mind_radius + 1`` can miss an interior stencil
+            entirely and only the coarser lattice is scored.  Denser
+            sampling does not move the minimum on a smooth image; the
+            Mattes random fraction is not reused, because a 10% draw can
+            miss the structure the stencil is measuring and would depend
+            on the wall-clock seed.  MIND masks, when set, are frozen at
+            the initial pose.  A large initial misalignment can exclude
+            the true overlap and fail instead of drifting.
     """
 
     metric: str = "mattes_mi"
@@ -89,6 +127,8 @@ class RegistrationConfig:
     mask_kind: str = "none"
     dilation_mm: float = 12.0
     bspline_grid_spacing_mm: Optional[float] = None
+    mind_radius: int = MIND_RADIUS
+    mind_sample_stride: int = MIND_SAMPLE_STRIDE
 
     def __post_init__(self):
         transforms = ("bspline", "rigid", "affine", "rigid_bspline")
@@ -119,6 +159,8 @@ class RegistrationConfig:
                     "bspline_grid_spacing_mm must be positive, "
                     f"got {self.bspline_grid_spacing_mm!r}"
                 )
+        _require_positive_int("mind_radius", self.mind_radius)
+        _require_positive_int("mind_sample_stride", self.mind_sample_stride)
 
     @classmethod
     def liver_respiratory(cls) -> "RegistrationConfig":
@@ -199,6 +241,7 @@ class SimpleITKRegistrar:
         "mattes_mi": "MattesMutualInformation",
         "correlation": "Correlation",
         "ants_neighborhood_correlation": "ANTSNeighborhoodCorrelation",
+        "mind": "MIND",
     }
 
     _INTERPOLATORS = {
@@ -322,6 +365,16 @@ class SimpleITKRegistrar:
         """Build and run one stage; returns (transform, method)."""
         if config.transform_kind == "rigid_bspline":
             return self._execute_cascade(fixed_image, moving_image, config)
+        if config.metric == "mind":
+            # Built-in metrics cannot consume a neighbourhood descriptor.
+            # Leaving this above the SimpleITK block keeps that block on
+            # the historical Mattes / correlation / local-NCC path.
+            return self._execute_mind(
+                fixed_image,
+                moving_image,
+                config,
+                moving_initial_transform,
+            )
         method = sitk.ImageRegistrationMethod()
         self._configure_metric(method, config)
         # The historical single-stage B-spline keeps gradient descent.
@@ -367,6 +420,57 @@ class SimpleITKRegistrar:
         composite.AddTransform(rigid_tx)
         composite.AddTransform(bspline_tx)
         return composite, method
+
+    def _execute_mind(
+        self,
+        fixed_image,
+        moving_image,
+        config,
+        moving_initial_transform=None,
+    ):
+        """Minimize the MIND distance on the same initial transform.
+
+        The SimpleITK optimizer below is not used.  Radius and stride stay
+        on the original voxel grid, so the intensity pyramid is not applied
+        either.  Masks are the same Otsu or percentile masks as the other
+        metrics; they only choose which voxels the descriptor distance sees.
+        """
+
+        transform = self._initial_transform(fixed_image, moving_image, config)
+        fixed_mask, moving_mask = self._metric_masks(
+            fixed_image, moving_image, config
+        )
+        outcome = optimize_mind(
+            fixed_image,
+            moving_image,
+            transform,
+            moving_initial_transform=moving_initial_transform,
+            fixed_mask=fixed_mask,
+            moving_mask=moving_mask,
+            radius=int(config.mind_radius),
+            sample_stride=int(config.mind_sample_stride),
+            iterations=int(config.iterations),
+            convergence=float(config.convergence_min_value),
+        )
+        return transform, _MetricRecord(
+            outcome.value, outcome.iterations, outcome.stop_condition
+        )
+
+    def _metric_masks(self, fixed_image, moving_image, config):
+        """Fixed and moving masks, or ``(None, None)`` when the metric is unmasked."""
+
+        kind = _active_mask_kind(config)
+        if kind == "none":
+            return None, None
+        if kind == "percentile":
+            return (
+                self._foreground_mask(fixed_image, config.foreground_percentile),
+                self._foreground_mask(moving_image, config.foreground_percentile),
+            )
+        return (
+            self._otsu_dilated_mask(fixed_image, config.dilation_mm),
+            self._otsu_dilated_mask(moving_image, config.dilation_mm),
+        )
 
     def _initial_transform(self, fixed_image, moving_image, config):
         """Initial transform.  The default kind is still a B-spline."""
@@ -414,21 +518,11 @@ class SimpleITKRegistrar:
         return mesh
 
     def _configure_mask(self, method, fixed_image, moving_image, config):
-        kind = _active_mask_kind(config)
-        if kind == "none":
+        fixed_mask, moving_mask = self._metric_masks(
+            fixed_image, moving_image, config
+        )
+        if fixed_mask is None:
             return
-        if kind == "percentile":
-            fixed_mask = self._foreground_mask(
-                fixed_image, config.foreground_percentile
-            )
-            moving_mask = self._foreground_mask(
-                moving_image, config.foreground_percentile
-            )
-        else:
-            fixed_mask = self._otsu_dilated_mask(fixed_image, config.dilation_mm)
-            moving_mask = self._otsu_dilated_mask(
-                moving_image, config.dilation_mm
-            )
         method.SetMetricFixedMask(fixed_mask)
         method.SetMetricMovingMask(moving_mask)
 
@@ -570,6 +664,31 @@ class SimpleITKRegistrar:
         overlap = sitk.LabelOverlapMeasuresImageFilter()
         overlap.Execute(fixed_binary, moving_binary)
         return float(overlap.GetDiceCoefficient())
+
+
+class _MetricRecord:
+    """Enough of ImageRegistrationMethod for the shared result builder."""
+
+    def __init__(self, value, iterations, stop_condition):
+        self._value = float(value)
+        self._iterations = int(iterations)
+        self._stop_condition = str(stop_condition)
+
+    def GetMetricValue(self):
+        return self._value
+
+    def GetOptimizerIteration(self):
+        return self._iterations
+
+    def GetOptimizerStopConditionDescription(self):
+        return self._stop_condition
+
+
+def _require_positive_int(name, value):
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise TypeError(f"{name} must be an integer >= 1, got {value!r}")
+    if int(value) < 1:
+        raise ValueError(f"{name} must be an integer >= 1, got {value!r}")
 
 
 def _active_mask_kind(config):
