@@ -685,7 +685,12 @@ def _descriptor_gradient(descriptor: np.ndarray) -> np.ndarray:
     """Central ``d(descriptor)/d(index)`` in SimpleITK axis order (x, y, z)."""
 
     spatial = descriptor.ndim - 1
-    grads = np.gradient(descriptor, axis=tuple(range(spatial)))
+    grads = [
+        np.gradient(descriptor, axis=axis)
+        if descriptor.shape[axis] > 1
+        else np.zeros_like(descriptor)
+        for axis in range(spatial)
+    ]
     ordered = [grads[spatial - 1 - axis] for axis in range(spatial)]
     return np.stack(ordered, axis=-1)
 
