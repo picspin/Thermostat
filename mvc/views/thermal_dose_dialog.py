@@ -29,6 +29,7 @@ from mvc.models.thermal_dose import (
     REFERENCE_TEMPERATURE_C,
     ThermalDoseError,
     format_dose_summary,
+    mask_exclusion_note,
 )
 
 
@@ -51,8 +52,9 @@ def create_thermal_dose_dialog(parent, result, recalculate=None):
 
     ``recalculate`` is an optional callback with no arguments that returns a
     new ``ThermalDoseResult`` from the current ROI.  It is the "Update ROI
-    curves" button.  A ``ThermalDoseError`` from that callback is shown and
-    the previous result stays on screen.
+    curves" button.  Any error from that callback is shown and the previous
+    result stays on screen.  A missing file or a bad ROI shape is not a
+    ``ThermalDoseError``, and those must not escape the button slot.
     """
 
     dialog = QDialog(parent)
@@ -79,9 +81,9 @@ def create_thermal_dose_dialog(parent, result, recalculate=None):
     map_layout.setContentsMargins(0, 0, 0, 0)
     map_layout.addWidget(NavigationToolbar(map_canvas, dialog))
     map_layout.addWidget(map_canvas)
-    map_layout.addWidget(QLabel(
-        "Black voxels had low signal or no valid temperature and were not accumulated."
-    ))
+    black_label = QLabel("")
+    black_label.setWordWrap(True)
+    map_layout.addWidget(black_label)
     body.addWidget(map_panel, stretch=1)
 
     curve_panel = QWidget()
@@ -170,29 +172,29 @@ def create_thermal_dose_dialog(parent, result, recalculate=None):
                 dose_result.roi_mean_temperature,
                 "o-",
                 color="tab:blue",
-                label="ROI mean temperature",
+                label="ROI mean temperature (valid on every frame)",
             )
             dose_axis.plot(
                 elapsed,
                 dose_result.roi_cumulative_mean,
                 "o-",
                 color="tab:red",
-                label="ROI mean cumulative dose",
+                label="ROI mean cumulative dose (same voxels)",
             )
             dose_axis.plot(
                 elapsed,
                 dose_result.roi_cumulative_max,
                 "s--",
                 color="tab:orange",
-                label="ROI max cumulative dose",
+                label="ROI max cumulative dose (same voxels)",
             )
         temp_axis.set_xlabel("Time from first AcquisitionTime (min)")
         temp_axis.set_ylabel("Temperature (°C)")
-        temp_axis.set_title("ROI temperature")
+        temp_axis.set_title("ROI temperature (voxels valid on every frame)")
         temp_axis.grid(True, alpha=0.3)
         dose_axis.set_xlabel("Time from first AcquisitionTime (min)")
         dose_axis.set_ylabel("CEM43 (equivalent minutes)")
-        dose_axis.set_title("ROI cumulative dose")
+        dose_axis.set_title("ROI cumulative dose (same voxels)")
         dose_axis.grid(True, alpha=0.3)
         if temperature_box.isChecked():
             temp_axis.axhline(
@@ -220,25 +222,42 @@ def create_thermal_dose_dialog(parent, result, recalculate=None):
         temp_canvas.draw_idle()
         dose_canvas.draw_idle()
 
+    def apply_result(dose_result):
+        state["result"] = dose_result
+        summary.setText(format_dose_summary(dose_result))
+        note = mask_exclusion_note(dose_result)
+        black = (
+            "Black voxels had low signal or no valid temperature and were not accumulated."
+        )
+        if note:
+            black = black + " " + note
+        black_label.setText(black)
+        draw_map(dose_result)
+        draw_curves()
+
     def on_update_roi():
         if recalculate is None:
             return
         try:
-            state["result"] = recalculate()
+            updated = recalculate()
         except ThermalDoseError as exc:
             QMessageBox.warning(dialog, "CEM43 thermal dose", str(exc))
             return
-        summary.setText(format_dose_summary(state["result"]))
-        draw_map(state["result"])
-        draw_curves()
+        except Exception as exc:
+            QMessageBox.warning(
+                dialog,
+                "CEM43 thermal dose",
+                f"CEM43 was not recalculated: {exc}",
+            )
+            return
+        apply_result(updated)
 
     temperature_box.stateChanged.connect(lambda _state: draw_curves())
     for box in dose_boxes:
         box.stateChanged.connect(lambda _state: draw_curves())
     update_button.clicked.connect(on_update_roi)
     close_button.clicked.connect(dialog.accept)
-    draw_map(result)
-    draw_curves()
+    apply_result(result)
 
     def release_figures():
         plt.close(map_figure)

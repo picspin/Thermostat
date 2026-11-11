@@ -57,6 +57,9 @@ class CinemaModel(QObject):
         # had enough signal to be accumulated into CEM43.  This does not
         # change the temperature values or the registration.
         self.validity_sequence = []
+        # Set for the run that produced temperature_sequence.  False means
+        # the maps are consecutive-pair changes, not absolute temperature.
+        self.motion_correction_applied = False
         
     def calculate_temperature_sequence(self, real_files, imag_files, original_temperature=37.0, 
                                       apply_gaussian=False, apply_b0_correction=False,
@@ -97,6 +100,10 @@ class CinemaModel(QObject):
         # CEM43; they are not part of the registration.
         self.temperature_sequence = []
         self.validity_sequence = []
+        # True only when every later frame is compared with the first phase.
+        # Consecutive-pair maps stay as they are; CEM43 must not treat them
+        # as absolute temperature.  This flag does not change the warp.
+        self.motion_correction_applied = bool(apply_motion_correction)
         
         # Calculate total number of pairs
         total_pairs = len(real_files) - 1

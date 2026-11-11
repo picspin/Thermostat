@@ -8,6 +8,10 @@ R is 0.25 below 43°C and 0.5 at or above 43°C.  Δtᵢ is in minutes.  This
 module does not register images and does not assume equally spaced frames.
 A missing Acquisition Time stops the calculation.
 
+The sum is a rectangle.  The whole Δtᵢ is multiplied by R^(43−Tᵢ) at the
+temperature at the end of that interval.  Heating inside the interval is
+not modeled.
+
 Low-signal voxels are excluded only when the caller passes a validity mask
 (the thermometry model records the same 10% magnitude mask it already uses
 for PRF).  A missing mask does not mean those voxels are low-SNR; only
@@ -17,7 +21,14 @@ frame (``None``) adds nothing for its interval; the other frames are kept.
 
 Cinema maps are used as stored.  With motion correction off, each map is the
 baseline plus the change between that pair of frames, not temperature versus
-the first phase.  This module does not rewrite those maps.
+the first phase.  This module does not rewrite those maps.  The controller
+must not present that number as CEM43; see
+``CONSECUTIVE_PAIR_DOSE_MESSAGE``.
+
+An ROI curve uses only voxels that are valid on every frame that has a
+temperature.  A voxel that joins late has a shorter history, so it is left
+out of both the temperature curve and the cumulative-dose curve.  The map
+still keeps every voxel that was valid on at least one frame.
 """
 
 from __future__ import annotations
@@ -45,6 +56,20 @@ REFERENCE_DISCLAIMER = (
     "(MR radiofrequency safety recommendations). "
     "These lines are not a treatment endpoint and do not indicate that "
     "treatment is complete."
+)
+
+# Above this fraction, a black dose map is no longer self-explanatory.
+# The 10% magnitude mask uses the brightest pixel, so one artifact can
+# exclude almost the whole image.
+HIGH_MASK_EXCLUSION_FRACTION = 0.95
+
+CONSECUTIVE_PAIR_DOSE_MESSAGE = (
+    "Motion correction is off. Each Cinema temperature map is the baseline "
+    "plus the change between that pair of frames, not absolute temperature "
+    "versus the first phase. CEM43 was not shown, because using those maps "
+    "would systematically underestimate the dose. Turn motion correction on "
+    "so every frame is compared with the first phase, then run the sequence "
+    "again. Equal spacing was not assumed."
 )
 
 ACQUISITION_TIME_TAG = (0x0008, 0x0032)
@@ -86,6 +111,11 @@ class ThermalDoseResult:
     roi_cumulative_mean: Optional[np.ndarray]
     roi_cumulative_max: Optional[np.ndarray]
     map_max_cem43: float
+    # Share of voxels that had a finite temperature and still never
+    # accumulated.  With a low-signal mask, that is the mask (or an
+    # overflowing rate), not a missing Acquisition Time.
+    mask_excluded_fraction: float
+    low_signal_mask_applied: bool
 
 
 def r_factor(temperature):
@@ -144,14 +174,13 @@ def accumulate_thermal_dose(
 
     running = np.zeros(shape, dtype=float)
     ever_valid = np.zeros(shape, dtype=bool)
-    roi_temperature = [] if roi is not None else None
-    roi_mean = [] if roi is not None else None
-    roi_max = [] if roi is not None else None
+    finite_somewhere = np.zeros(shape, dtype=bool)
+    frame_valid = [] if roi is not None else None
+    mask_applied = False
 
     for index, temperature in enumerate(maps):
         if temperature is None:
             valid = np.zeros(shape, dtype=bool)
-            observed = None
         else:
             observed = np.asarray(temperature, dtype=float)
             if observed.shape != shape:
@@ -159,6 +188,9 @@ def accumulate_thermal_dose(
                     f"Temperature frame {index + 1} has shape {observed.shape}, "
                     f"expected {shape}."
                 )
+            finite_somewhere |= np.isfinite(observed)
+            if masks[index] is not None:
+                mask_applied = True
             valid = _valid_voxels(observed, masks[index])
             increment = np.zeros(shape, dtype=float)
             if np.any(valid):
@@ -173,30 +205,37 @@ def accumulate_thermal_dose(
                 increment[valid] = delta_t[index] * rate
             running = running + increment
             ever_valid |= valid
-
-        if roi is not None:
-            roi_temperature.append(_roi_mean_temperature(observed, valid, roi))
-            eligible = ever_valid & roi
-            if not np.any(eligible):
-                roi_mean.append(np.nan)
-                roi_max.append(np.nan)
-            else:
-                doses = running[eligible]
-                roi_mean.append(float(np.mean(doses)))
-                roi_max.append(float(np.max(doses)))
+        if frame_valid is not None:
+            # Copy after overflow rejection, so the ROI cohort matches the map.
+            frame_valid.append(np.array(valid, copy=True))
 
     cem43 = np.where(ever_valid, running, np.nan)
     finite = cem43[np.isfinite(cem43)]
     map_max = float(np.max(finite)) if finite.size else float("nan")
     elapsed = np.cumsum(delta_t)
+    n_voxels = float(ever_valid.size)
+    # Finite somewhere, but never accumulated: the mask or an overflowing rate.
+    mask_excluded_fraction = float(
+        np.count_nonzero(finite_somewhere & ~ever_valid) / n_voxels
+    )
+    if roi is None:
+        roi_temperature = None
+        roi_mean = None
+        roi_max = None
+    else:
+        roi_temperature, roi_mean, roi_max = _roi_curves(
+            maps, delta_t, frame_valid, roi
+        )
     return ThermalDoseResult(
         cem43=cem43,
         delta_t_minutes=delta_t,
         elapsed_minutes=elapsed,
-        roi_mean_temperature=None if roi_temperature is None else np.asarray(roi_temperature, dtype=float),
-        roi_cumulative_mean=None if roi_mean is None else np.asarray(roi_mean, dtype=float),
-        roi_cumulative_max=None if roi_max is None else np.asarray(roi_max, dtype=float),
+        roi_mean_temperature=roi_temperature,
+        roi_cumulative_mean=roi_mean,
+        roi_cumulative_max=roi_max,
         map_max_cem43=map_max,
+        mask_excluded_fraction=mask_excluded_fraction,
+        low_signal_mask_applied=mask_applied,
     )
 
 
@@ -239,7 +278,9 @@ def clocks_for_phases(real_sources, n_phases, imag_sources=None):
     if real_sources is None or len(real_sources) < n_phases:
         found = 0 if not real_sources else len(real_sources)
         raise ThermalDoseError(
-            f"Need AcquisitionTime for {n_phases} phases, found {found} real images. "
+            f"Need {n_phases} real images to read AcquisitionTime, "
+            f"found {found} files. This is a file count, not a count of "
+            "phases that already have AcquisitionTime. "
             "CEM43 was not calculated, and equal spacing was not assumed."
         )
     clocks = []
@@ -418,8 +459,34 @@ def format_dose_summary(result: ThermalDoseResult) -> str:
             " ROI cumulative dose: mean "
             f"{result.roi_cumulative_mean[-1]:.3f} CEM43, max "
             f"{result.roi_cumulative_max[-1]:.3f} CEM43."
+            " The ROI curves count only voxels valid on every frame."
         )
+    note = mask_exclusion_note(result)
+    if note:
+        summary += " " + note
     return summary
+
+
+def mask_exclusion_note(result: ThermalDoseResult):
+    """Why a nearly black dose map happened, or None when it did not.
+
+    The thermometry mask is ``magnitude > 0.1 * max(magnitude)``.  One bright
+    pixel raises that line.  The dose map then goes black while the
+    temperature values are still finite.  Callers should say so instead of
+    leaving "no valid voxels" unexplained.
+    """
+
+    if not result.low_signal_mask_applied:
+        return None
+    if result.mask_excluded_fraction <= HIGH_MASK_EXCLUSION_FRACTION:
+        return None
+    percent = 100.0 * result.mask_excluded_fraction
+    return (
+        f"{percent:.1f}% of voxels had a finite temperature but were not "
+        "accumulated. One possible cause is a single bright pixel or artifact "
+        "raising the 10% magnitude threshold until almost the whole map is "
+        "excluded. Black is not a dose of zero."
+    )
 
 
 def _rate(temperature: np.ndarray) -> np.ndarray:
@@ -445,13 +512,42 @@ def _valid_voxels(temperature: np.ndarray, mask) -> np.ndarray:
     return valid
 
 
-def _roi_mean_temperature(temperature, valid, roi) -> float:
-    if temperature is None:
-        return float("nan")
-    usable = valid & roi
-    if not np.any(usable):
-        return float("nan")
-    return float(np.mean(np.asarray(temperature, dtype=float)[usable]))
+def _roi_curves(maps, delta_t, frame_valid, roi):
+    """Temperature and cumulative dose for one stable ROI cohort.
+
+    The cohort is the ROI intersection of voxels valid on every frame that
+    has a temperature.  A missing frame does not shrink it.  Both curves use
+    that same set, so a voxel with only part of the history cannot pull the
+    mean down.  An empty cohort leaves NaN; it does not fall back to "voxels
+    valid so far".
+    """
+
+    n_frames = len(maps)
+    temperatures = np.full(n_frames, np.nan, dtype=float)
+    means = np.full(n_frames, np.nan, dtype=float)
+    maxima = np.full(n_frames, np.nan, dtype=float)
+    cohort = np.array(roi, dtype=bool, copy=True)
+    saw_frame = False
+    for temperature, valid in zip(maps, frame_valid):
+        if temperature is None:
+            continue
+        cohort &= valid
+        saw_frame = True
+    if not saw_frame or not np.any(cohort):
+        return temperatures, means, maxima
+    dose = np.zeros(int(np.count_nonzero(cohort)), dtype=float)
+    for index, temperature in enumerate(maps):
+        if temperature is not None:
+            observed = np.asarray(temperature, dtype=float)[cohort]
+            temperatures[index] = float(np.mean(observed))
+            rate = _rate(observed)
+            usable = np.isfinite(rate)
+            step = np.zeros_like(dose)
+            step[usable] = delta_t[index] * rate[usable]
+            dose = dose + step
+        means[index] = float(np.mean(dose))
+        maxima[index] = float(np.max(dose))
+    return temperatures, means, maxima
 
 
 def _require_intervals(delta_t_minutes, n_frames) -> np.ndarray:

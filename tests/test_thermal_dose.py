@@ -13,6 +13,7 @@ from mvc.controllers.advanced_features_controller import AdvancedFeaturesControl
 from mvc.models.cinema_model import CinemaModel
 from mvc.models.registration import RegistrationConfig
 from mvc.models.thermal_dose import (
+    CONSECUTIVE_PAIR_DOSE_MESSAGE,
     REFERENCE_CEM43_EQUIVALENT_MINUTES,
     REFERENCE_DISCLAIMER,
     REFERENCE_TEMPERATURE_C,
@@ -21,7 +22,10 @@ from mvc.models.thermal_dose import (
     accumulate_cem43,
     accumulate_thermal_dose,
     calculate_cinema_cem43,
+    clocks_for_phases,
+    format_dose_summary,
     intervals_minutes,
+    mask_exclusion_note,
     parse_acquisition_time,
     r_factor,
     read_acquisition_clock,
@@ -51,6 +55,20 @@ def test_r_factor_differs_at_42c_and_44c():
     np.testing.assert_allclose(cool, 0.25)
     np.testing.assert_allclose(hot, 2.0)
     assert cool.item() != hot.item()
+
+
+def test_mixed_intervals_and_temperatures_sum_the_isoeffect():
+    # 42°C for 2 min is 0.25^(43-42) * 2 = 0.5.
+    # 44°C for 3 min is 0.5^(43-44) * 3 = 6.
+    # The rectangle sum is 6.5, and elapsed time is the running sum.
+    result = accumulate_thermal_dose(
+        [np.full((1, 1), 42.0), np.full((1, 1), 44.0)],
+        [2.0, 3.0],
+    )
+
+    np.testing.assert_allclose(result.cem43, 6.5)
+    np.testing.assert_allclose(result.delta_t_minutes, [2.0, 3.0])
+    np.testing.assert_allclose(result.elapsed_minutes, [2.0, 5.0])
 
 
 def test_missing_interval_fails_and_does_not_assume_equal_spacing():
@@ -188,6 +206,73 @@ def test_roi_temperature_and_cumulative_dose():
     np.testing.assert_allclose(result.roi_cumulative_mean, [1.5])
     np.testing.assert_allclose(result.roi_cumulative_max, [2.0])
     assert result.roi_mean_temperature is not None
+    assert "valid on every frame" in format_dose_summary(result)
+
+
+def test_roi_curves_ignore_voxels_that_join_late():
+    # The second voxel is masked on the first frame, so it only has one
+    # minute of dose.  Averaging it with the two-minute voxel would report
+    # 1.5.  Both curves stay on the voxel that was valid the whole time.
+    maps = [np.full((1, 2), 43.0), np.full((1, 2), 43.0)]
+    masks = [
+        np.array([[True, False]]),
+        np.array([[True, True]]),
+    ]
+    roi = np.array([[True, True]])
+
+    result = accumulate_thermal_dose(
+        maps, [1.0, 1.0], valid_masks=masks, roi_mask=roi
+    )
+
+    np.testing.assert_allclose(result.cem43[0, 0], 2.0)
+    np.testing.assert_allclose(result.cem43[0, 1], 1.0)
+    np.testing.assert_allclose(result.roi_mean_temperature, [43.0, 43.0])
+    np.testing.assert_allclose(result.roi_cumulative_mean, [1.0, 2.0])
+    np.testing.assert_allclose(result.roi_cumulative_max, [1.0, 2.0])
+
+
+def test_missing_frame_does_not_drop_the_roi_cohort():
+    maps = [np.full((1, 1), 43.0), None, np.full((1, 1), 43.0)]
+    roi = np.array([[True]])
+
+    result = accumulate_thermal_dose(maps, [1.0, 1.0, 1.0], roi_mask=roi)
+
+    assert np.isnan(result.roi_mean_temperature[1])
+    np.testing.assert_allclose(result.roi_mean_temperature[0], 43.0)
+    np.testing.assert_allclose(result.roi_mean_temperature[2], 43.0)
+    np.testing.assert_allclose(result.roi_cumulative_mean, [1.0, 1.0, 2.0])
+
+
+def test_summary_names_a_mask_that_blacks_out_the_map():
+    temperature = np.full((20, 20), 43.0)
+    mask = np.zeros((20, 20), dtype=bool)
+    mask[0, 0] = True
+
+    result = accumulate_thermal_dose(
+        [temperature], [1.0], valid_masks=[mask]
+    )
+
+    assert result.mask_excluded_fraction > 0.95
+    note = mask_exclusion_note(result)
+    assert note is not None
+    assert "10% magnitude" in note
+    assert "bright pixel" in note
+    assert "not a dose of zero" in note
+    summary = format_dose_summary(result)
+    assert note in summary
+    # A mask that keeps the image does not grow the same warning.
+    kept = accumulate_thermal_dose(
+        [temperature],
+        [1.0],
+        valid_masks=[np.ones((20, 20), dtype=bool)],
+    )
+    assert mask_exclusion_note(kept) is None
+    assert "bright pixel" not in format_dose_summary(kept)
+
+
+def test_too_few_real_images_reports_a_file_count_not_timed_phases():
+    with pytest.raises(ThermalDoseError, match="file count"):
+        clocks_for_phases([Dataset()], 2)
 
 
 def test_backwards_clock_is_not_turned_into_a_midnight_dose():
@@ -293,6 +378,7 @@ def test_cinema_copies_the_low_signal_mask_without_changing_temperature():
     )
 
     assert len(sequence) == 1
+    assert cinema.motion_correction_applied is False
     assert len(cinema.validity_sequence) == 1
     assert cinema.validity_sequence[0][0, 0]
     assert not cinema.validity_sequence[0][1, 1]
@@ -301,19 +387,104 @@ def test_cinema_copies_the_low_signal_mask_without_changing_temperature():
     np.testing.assert_allclose(sequence[0], model.temperature_map)
 
 
+def test_failed_load_keeps_temperature_and_validity_aligned():
+    model = _RecordingModel()
+
+    def load_real2(path):
+        return path != "r2"
+
+    def calculate(**_kwargs):
+        model.temperature_map = np.full((4, 4), 43.0)
+        mask = np.zeros((4, 4), dtype=bool)
+        mask[0, 0] = True
+        model.valid_temperature_mask = mask
+        return True
+
+    model.load_real2_dicom = load_real2
+    model.calculate_temperature = calculate
+    cinema = _cinema(model)
+
+    sequence = cinema.calculate_temperature_sequence(
+        ["r0", "r1", "r2"],
+        ["i0", "i1", "i2"],
+        apply_motion_correction=False,
+    )
+
+    assert len(sequence) == len(cinema.validity_sequence) == 2
+    assert sequence[0] is not None
+    assert cinema.validity_sequence[0] is not None
+    assert cinema.validity_sequence[0][0, 0]
+    assert sequence[1] is None
+    assert cinema.validity_sequence[1] is None
+
+
+def test_motion_correction_flag_stays_set_when_a_frame_is_rejected():
+    model = _RecordingModel()
+    cinema = _cinema(model)
+
+    class _Registrar:
+        def register_complex(self, **_kwargs):
+            return type("Result", (), {
+                "status": "failed",
+                "warped_real": None,
+                "message": "no",
+                "mae_before": float("nan"),
+                "mae_after": float("nan"),
+                "folding_ratio": float("nan"),
+            })()
+
+    sequence = cinema.calculate_temperature_sequence(
+        ["r0", "r1"],
+        ["i0", "i1"],
+        apply_motion_correction=True,
+        registrar=_Registrar(),
+    )
+
+    assert cinema.motion_correction_applied is True
+    assert sequence == [None]
+
+
+def test_consecutive_pair_maps_are_not_shown_as_cem43():
+    view = _FakeView()
+    first = Dataset()
+    first.AcquisitionTime = "100000"
+    second = Dataset()
+    second.AcquisitionTime = "100100"
+    view.all_real_files = [first, second]
+    view.all_imag_files = [first, second]
+    controller = AdvancedFeaturesController.__new__(AdvancedFeaturesController)
+    controller.view = view
+    controller.cinema_model = type("Cinema", (), {
+        "validity_sequence": [np.ones((1, 1), dtype=bool)],
+        "motion_correction_applied": False,
+    })()
+
+    controller._show_thermal_dose([np.full((1, 1), 50.0)])
+
+    assert view.errors == [CONSECUTIVE_PAIR_DOSE_MESSAGE]
+    assert "CEM43 was not shown" in view.errors[0]
+    assert "systematically underestimate" in view.errors[0]
+    assert not any("Map maximum" in status for status in view.statuses)
+    assert view.status_timeouts[-1] == 0
+
+
 def test_controller_reports_a_missing_acquisition_time():
     view = _FakeView()
     view.all_real_files = [Dataset(), Dataset()]
     view.all_imag_files = [Dataset(), Dataset()]
     controller = AdvancedFeaturesController.__new__(AdvancedFeaturesController)
     controller.view = view
-    controller.cinema_model = type("Cinema", (), {"validity_sequence": [None]})()
+    controller.cinema_model = type("Cinema", (), {
+        "validity_sequence": [None],
+        "motion_correction_applied": True,
+    })()
 
     controller._show_thermal_dose([np.full((2, 2), 43.0)])
 
     assert view.errors
     assert "AcquisitionTime" in view.errors[0]
     assert "equal spacing was not assumed" in view.errors[0]
+    assert "CEM43 was not shown" not in view.errors[0]
     assert view.status_timeouts[-1] == 0
 
 
@@ -362,8 +533,159 @@ def test_dose_dialog_keeps_reference_lines_optional():
         dose_9.setChecked(True)
         assert _horizontal_values(temperature_axis) == [39.0]
         assert _horizontal_values(dose_axis) == [2.0, 9.0]
+        titles = (
+            temperature_axis.get_title(),
+            dose_axis.get_title(),
+        )
+        assert "valid on every frame" in titles[0]
+        assert "same voxels" in titles[1]
     finally:
         dialog.close()
+
+
+def test_dose_dialog_explains_a_nearly_black_map():
+    pytest.importorskip("PyQt5")
+    from PyQt5.QtWidgets import QLabel
+
+    _ensure_qt_app()
+    temperature = np.full((20, 20), 43.0)
+    mask = np.zeros((20, 20), dtype=bool)
+    mask[0, 0] = True
+    result = accumulate_thermal_dose([temperature], [1.0], valid_masks=[mask])
+    dialog = _dose_dialog(result)
+    try:
+        texts = [label.text() for label in dialog.findChildren(QLabel)]
+        assert any("bright pixel" in text and "Black voxels" in text for text in texts)
+        assert any("not a dose of zero" in text for text in texts)
+    finally:
+        dialog.close()
+
+
+def test_update_roi_reports_unexpected_errors(monkeypatch):
+    pytest.importorskip("PyQt5")
+    from PyQt5.QtWidgets import QLabel, QMessageBox, QPushButton
+
+    _ensure_qt_app()
+    warnings = []
+
+    def warning(*args):
+        warnings.append(args)
+
+    monkeypatch.setattr(QMessageBox, "warning", warning)
+    result = accumulate_thermal_dose([np.full((2, 2), 43.0)], [1.0])
+
+    def recalculate():
+        raise RuntimeError("files moved")
+
+    dialog = _dose_dialog(result, recalculate)
+    try:
+        before = [label.text() for label in dialog.findChildren(QLabel)]
+        buttons = {button.text(): button for button in dialog.findChildren(QPushButton)}
+        buttons["Update ROI curves"].click()
+        after = [label.text() for label in dialog.findChildren(QLabel)]
+        assert warnings
+        assert "files moved" in warnings[-1][2]
+        assert "was not recalculated" in warnings[-1][2]
+        # The failed refresh must leave the previous summary on screen.
+        assert before == after
+        assert any("Map maximum" in text for text in after)
+    finally:
+        dialog.close()
+
+
+def test_cinema_player_stays_usable_with_the_dose_dialog(monkeypatch):
+    pytest.importorskip("PyQt5")
+    from PyQt5.QtCore import Qt, QTimer
+    from PyQt5.QtWidgets import QApplication, QMessageBox, QWidget
+
+    _ensure_qt_app()
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args))
+    monkeypatch.setattr(
+        "mvc.controllers.advanced_features_controller.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    first = Dataset()
+    first.AcquisitionTime = "100000"
+    second = Dataset()
+    second.AcquisitionTime = "100100"
+    view = QWidget()
+    view.errors = []
+    view.statuses = []
+    view.status_timeouts = []
+    view.roi_manager = None
+    view.all_real_files = [first, second]
+    view.all_imag_files = [first, second]
+    view.window_center_input = _Value(40.0)
+    view.window_width_input = _Value(20.0)
+
+    def show_error(message):
+        view.errors.append(message)
+
+    def update_status(message, timeout_ms=5000):
+        view.statuses.append(message)
+        view.status_timeouts.append(timeout_ms)
+
+    view.show_error = show_error
+    view.update_status = update_status
+
+    temperature = np.full((2, 2), 43.0)
+    cinema = type("Cinema", (), {})()
+    cinema.validity_sequence = [np.ones((2, 2), dtype=bool)]
+    cinema.motion_correction_applied = True
+    cinema.temperature_sequence = [temperature]
+    cinema.cleared = 0
+
+    def clear_sequence():
+        cinema.cleared += 1
+        cinema.temperature_sequence = []
+        cinema.validity_sequence = []
+
+    cinema.clear_sequence = clear_sequence
+    controller = AdvancedFeaturesController.__new__(AdvancedFeaturesController)
+    controller.view = view
+    controller.cinema_model = cinema
+    state = {"returned": False, "blocked": False}
+    timer = QTimer()
+    timer.setSingleShot(True)
+
+    def watchdog():
+        if not state["returned"]:
+            state["blocked"] = True
+            QApplication.instance().closeAllWindows()
+
+    timer.timeout.connect(watchdog)
+    timer.start(500)
+    try:
+        controller.show_cinema_dialog([temperature])
+        state["returned"] = True
+        timer.stop()
+        QApplication.instance().processEvents()
+        assert state["blocked"] is False
+        assert warnings == []
+        player = controller._cinema_dialog
+        dose = controller._thermal_dose_dialog
+        assert player.windowModality() == Qt.NonModal
+        assert dose.windowModality() == Qt.NonModal
+        assert player.isVisible()
+        assert dose.isVisible()
+        assert any("1.000 CEM43" in status for status in view.statuses)
+        # A later run with motion correction off must not leave this dose up.
+        cinema.motion_correction_applied = False
+        controller._show_thermal_dose([temperature])
+        assert warnings
+        assert "CEM43 was not shown" in warnings[-1][2]
+        assert dose.isVisible() is False
+    finally:
+        state["returned"] = True
+        timer.stop()
+        player = getattr(controller, "_cinema_dialog", None)
+        dose = getattr(controller, "_thermal_dose_dialog", None)
+        if player is not None:
+            player.close()
+        if dose is not None:
+            dose.close()
 
 
 class _FakeView:
@@ -458,6 +780,33 @@ def _write_dicom(path, acquisition_time=None, series_time=None):
         little_endian=True,
         enforce_file_format=True,
     )
+
+
+class _Value:
+    def __init__(self, value):
+        self._value = value
+
+    def value(self):
+        return self._value
+
+
+def _ensure_qt_app():
+    """Keep one QApplication alive for every dialog test in this module."""
+
+    from PyQt5.QtWidgets import QApplication
+
+    global _QT_APP
+    if QApplication.instance() is None:
+        _QT_APP = QApplication([])
+    else:
+        _QT_APP = QApplication.instance()
+    return _QT_APP
+
+
+def _dose_dialog(result, recalculate=None):
+    from mvc.views.thermal_dose_dialog import create_thermal_dose_dialog
+
+    return create_thermal_dose_dialog(None, result, recalculate=recalculate)
 
 
 def _dialog_axes(dialog):
