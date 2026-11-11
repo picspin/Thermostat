@@ -211,10 +211,8 @@ def optimize_mind(
             points.shape[0], channels, points.shape[1]
         )
         upper = np.array(moving_image.GetSize(), dtype=float) - 1.0
-        outside = np.any(
-            (moving_index < 0.0) | (moving_index > upper), axis=1
-        )
-        sampled_gradient[outside] = 0.0
+        outside = (moving_index < 0.0) | (moving_index > upper)
+        sampled_gradient = np.where(outside[:, None, :], 0.0, sampled_gradient)
         delta = sampled - reference
         # Past the border the descriptor is clamped, so its spatial gradient
         # is zero and a far pose looks stationary.  Count how far each index
