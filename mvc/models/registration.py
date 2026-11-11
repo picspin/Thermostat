@@ -54,7 +54,15 @@ class RegistrationConfig:
             reproducible.
         learning_rate: Gradient-descent learning rate.
         iterations: Maximum optimizer iterations per resolution level.
-        convergence_min_value: Convergence checker minimum value.
+            MIND has no pyramid.  For a rigid or affine MIND stage the
+            translation warm-up may use at most half of this budget
+            (rounded down) and the full solve gets the rest, so the
+            reported iteration count does not exceed it.  A MIND B-spline
+            spends the whole budget on its one solve.  A cascade still
+            runs one budget per stage, matching the other metrics.
+        convergence_min_value: Convergence checker minimum value.  MIND
+            passes it to L-BFGS-B as both ``ftol`` and ``gtol`` (the
+            projected-gradient tolerance, Fortran's ``pgtol``).
         convergence_window: Convergence checker window size.
         shrink_factors: Shrink factors per resolution level.
         smoothing_sigmas: Smoothing sigmas per resolution level.
@@ -86,10 +94,16 @@ class RegistrationConfig:
             stencil, which is the reason to prefer MIND over sum of squares.
         mind_sample_stride: Voxel stride of the MIND lattice.  Ignored
             unless ``metric="mind"``.  2 keeps one sample inside each
-            radius-1 stencil.  Denser sampling does not move the minimum on
-            a smooth image; the Mattes random fraction is not reused,
-            because a 10% draw can miss the structure the stencil is
-            measuring and would depend on the wall-clock seed.
+            interior radius-1 stencil.  The lattice is inset by the radius,
+            so the high-index edge can sit outside every stencil.  A stride
+            larger than ``2 * mind_radius + 1`` can miss an interior stencil
+            entirely and only the coarser lattice is scored.  Denser
+            sampling does not move the minimum on a smooth image; the
+            Mattes random fraction is not reused, because a 10% draw can
+            miss the structure the stencil is measuring and would depend
+            on the wall-clock seed.  MIND masks, when set, are frozen at
+            the initial pose.  A large initial misalignment can exclude
+            the true overlap and fail instead of drifting.
     """
 
     metric: str = "mattes_mi"
@@ -672,7 +686,7 @@ class _MetricRecord:
 
 def _require_positive_int(name, value):
     if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
-        raise ValueError(f"{name} must be an integer >= 1, got {value!r}")
+        raise TypeError(f"{name} must be an integer >= 1, got {value!r}")
     if int(value) < 1:
         raise ValueError(f"{name} must be an integer >= 1, got {value!r}")
 

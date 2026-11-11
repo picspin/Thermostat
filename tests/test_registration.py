@@ -7,11 +7,15 @@ import SimpleITK as sitk
 from mvc.models.mind import (
     MIND_RADIUS,
     MIND_SAMPLE_STRIDE,
+    _apply_transform,
     _geometry,
     _index_to_physical,
+    _iteration_budgets,
+    _mind_objective,
     _parameter_gradient,
     _physical_to_index,
     _pull_through_outer,
+    _sample_linear_channels,
     mind_descriptor,
     mind_distance,
 )
@@ -505,7 +509,7 @@ def test_mind_defaults_are_opt_in_and_do_not_change_the_other_metrics():
     assert checkbox.mask_kind == "otsu_dilated"
     with pytest.raises(ValueError, match="mind_radius"):
         RegistrationConfig(mind_radius=0)
-    with pytest.raises(ValueError, match="mind_radius"):
+    with pytest.raises(TypeError, match="mind_radius"):
         RegistrationConfig(mind_radius=1.9)
     with pytest.raises(ValueError, match="mind_sample_stride"):
         RegistrationConfig(mind_sample_stride=0)
@@ -914,3 +918,368 @@ def test_index_to_physical_matches_simpleitk_with_direction():
     np.testing.assert_allclose(
         _physical_to_index(physical, du_dp, image), index, atol=1e-12
     )
+
+
+def _finite_difference_objective(objective, theta, step):
+    base = np.asarray(theta, dtype=float)
+    finite = np.empty(base.shape, dtype=float)
+    for index in range(base.size):
+        plus = np.array(base, copy=True)
+        minus = np.array(base, copy=True)
+        plus[index] += step
+        minus[index] -= step
+        forward, _ = objective(plus)
+        backward, _ = objective(minus)
+        finite[index] = (forward - backward) / (2.0 * step)
+    return finite
+
+
+def _mind_image(array, spacing=None, direction=None, origin=None):
+    image = sitk.GetImageFromArray(np.asarray(array, dtype=np.float64))
+    if spacing is not None:
+        image.SetSpacing(tuple(float(value) for value in spacing))
+    if origin is not None:
+        image.SetOrigin(tuple(float(value) for value in origin))
+    if direction is not None:
+        image.SetDirection(tuple(float(value) for value in direction))
+    return image
+
+
+def test_mind_linear_slope_matches_map_coordinates_off_the_grid():
+    """Out-of-range axes lose only their own slope, including a singleton axis."""
+
+    from scipy.ndimage import map_coordinates
+
+    volume = np.arange(24, dtype=float).reshape(2, 3, 4)
+    volume = np.stack([volume, np.sqrt(volume + 1.0)], axis=-1)
+    index = np.array(
+        [
+            [1.3, 0.4, 0.2],
+            [-0.4, 1.2, 0.7],
+            [2.2, -0.3, 0.4],
+            [0.2, 0.35, 1.6],
+        ]
+    )
+    # A size-1 z axis: slope along z is zero, y and x are not cleared.
+    thin = volume[:1]
+    thin_index = np.array([[0.4, 1.3, 0.6], [-0.2, 0.7, 1.1]])
+    step = 1e-6
+    for sample_volume, sample_index in ((volume, index), (thin, thin_index)):
+        values, slope = _sample_linear_channels(sample_volume, sample_index)
+        for point in range(sample_index.shape[0]):
+            for channel in range(sample_volume.shape[-1]):
+                coordinates = sample_index[point, ::-1]
+                sampled = map_coordinates(
+                    sample_volume[..., channel],
+                    coordinates[:, None],
+                    order=1,
+                    mode="nearest",
+                    prefilter=False,
+                )
+                assert values[point, channel] == pytest.approx(
+                    float(sampled[0]), abs=1e-12
+                )
+        finite = np.empty_like(slope)
+        for axis in range(sample_index.shape[1]):
+            plus = np.array(sample_index, copy=True)
+            minus = np.array(sample_index, copy=True)
+            plus[:, axis] += step
+            minus[:, axis] -= step
+            forward, _ = _sample_linear_channels(sample_volume, plus)
+            backward, _ = _sample_linear_channels(sample_volume, minus)
+            finite[:, :, axis] = (forward - backward) / (2.0 * step)
+        np.testing.assert_allclose(slope, finite, atol=1e-8, rtol=1e-6)
+    _, thin_slope = _sample_linear_channels(thin, thin_index)
+    assert np.all(thin_slope[:, :, 2] == 0.0)
+    assert np.any(np.abs(thin_slope[:, :, 0]) > 0.0)
+    outside, outside_slope = _sample_linear_channels(
+        volume, np.array([[-0.4, 1.2, 0.7]])
+    )
+    assert np.all(outside_slope[:, :, 0] == 0.0)
+    assert np.any(np.abs(outside_slope[:, :, 1]) > 0.0)
+    assert outside.shape == (1, volume.shape[-1])
+
+
+def test_mind_objective_gradient_matches_finite_differences():
+    """The vector handed to L-BFGS-B is the slope of the sampled loss."""
+
+    fixed = _phantom((24, 22))
+    fixed_image = _mind_image(fixed, spacing=(1.5, 2.0), origin=(-1.0, 0.5))
+    moving_image = _mind_image(np.roll(fixed, (1, -1), axis=(0, 1)), spacing=(1.5, 2.0), origin=(-1.0, 0.5))
+    rigid = sitk.Euler2DTransform()
+    rigid.SetCenter((8.0, -3.0))
+    rigid.SetParameters((0.07, 0.35, -0.22))
+    objective = _mind_objective(
+        fixed_image, moving_image, rigid, None, None, None, 1, 2
+    )
+    theta = np.array(rigid.GetParameters(), dtype=float)
+    _, analytic = objective(theta)
+    finite = _finite_difference_objective(objective, theta, step=1e-6)
+    np.testing.assert_allclose(analytic, finite, atol=1e-6, rtol=1e-5)
+
+    size = 10
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    volume = np.exp(-((z - 4.0) ** 2 + (y - 6.0) ** 2 + (x - 3.0) ** 2) / 6.0)
+    fixed_3d = _mind_image(volume)
+    moving_3d = _mind_image(np.roll(volume, (1, 0, -1), axis=(0, 1, 2)))
+    euler3 = sitk.Euler3DTransform()
+    euler3.SetCenter((4.0, 4.0, 4.0))
+    euler3.SetParameters((0.05, -0.04, 0.03, 0.3, -0.2, 0.15))
+    objective_3d = _mind_objective(
+        fixed_3d, moving_3d, euler3, None, None, None, 1, 2
+    )
+    theta_3d = np.array(euler3.GetParameters(), dtype=float)
+    _, analytic_3d = objective_3d(theta_3d)
+    finite_3d = _finite_difference_objective(objective_3d, theta_3d, step=1e-6)
+    np.testing.assert_allclose(analytic_3d, finite_3d, atol=1e-6, rtol=1e-5)
+
+    # Generic entries keep every warped voxel off an integer index.  The
+    # linear interpolant is not differentiable exactly on a voxel boundary,
+    # so a round affine pose makes central differences disagree with the
+    # one-sided slope.
+    affine = sitk.AffineTransform(2)
+    affine.SetCenter((-0.16, -0.48))
+    affine.SetParameters(
+        (1.0210320893668023, -0.06263991337843045, 0.053443794125771577, 1.142775861944562, -0.06042913229433794, 0.06056412827127888)
+    )
+    objective_affine = _mind_objective(
+        fixed_image, moving_image, affine, None, None, None, 1, 2
+    )
+    theta_affine = np.array(affine.GetParameters(), dtype=float)
+    _, analytic_affine = objective_affine(theta_affine)
+    finite_affine = _finite_difference_objective(
+        objective_affine, theta_affine, step=1e-6
+    )
+    np.testing.assert_allclose(analytic_affine, finite_affine, atol=1e-6, rtol=1e-5)
+
+    bspline_image = _mind_image(fixed)
+    bspline = sitk.BSplineTransformInitializer(bspline_image, [2, 2])
+    parameters = np.zeros(bspline.GetNumberOfParameters(), dtype=float)
+    parameters[0] = 0.2
+    parameters[bspline.GetNumberOfParameters() // 2] = -0.15
+    bspline.SetParameters(tuple(float(value) for value in parameters))
+    outer = sitk.Euler2DTransform()
+    outer.SetCenter(
+        ((fixed.shape[1] - 1) / 2.0, (fixed.shape[0] - 1) / 2.0)
+    )
+    outer.SetParameters((0.12, 0.37, -0.18))
+    objective_bspline = _mind_objective(
+        bspline_image,
+        _mind_image(np.roll(fixed, (1, -1), axis=(0, 1))),
+        bspline,
+        outer,
+        None,
+        None,
+        1,
+        2,
+    )
+    theta_bspline = np.array(bspline.GetParameters(), dtype=float)
+    _, analytic_bspline = objective_bspline(theta_bspline)
+    # A few coefficients stand in for the whole field: the chain is linear
+    # in the control points, and a full finite difference is the same code.
+    chosen = np.linspace(0, theta_bspline.size - 1, 8, dtype=int)
+    finite_bspline = np.empty(chosen.size)
+    step = 1e-6
+    for index, parameter in enumerate(chosen):
+        plus = np.array(theta_bspline, copy=True)
+        minus = np.array(theta_bspline, copy=True)
+        plus[parameter] += step
+        minus[parameter] -= step
+        forward, _ = objective_bspline(plus)
+        backward, _ = objective_bspline(minus)
+        finite_bspline[index] = (forward - backward) / (2.0 * step)
+    np.testing.assert_allclose(
+        analytic_bspline[chosen], finite_bspline, atol=1e-6, rtol=1e-4
+    )
+
+
+def test_mind_rigid_recovers_a_known_rotation():
+    fixed = _phantom((40, 40))
+    moving = _resample_euler(fixed, angle_deg=12.0)
+    before = mind_distance(fixed, moving)
+    fixed_image = _mind_image(fixed)
+    moving_image = _mind_image(moving)
+    transform = sitk.Euler2DTransform()
+    transform.SetCenter(
+        ((fixed.shape[1] - 1) / 2.0, (fixed.shape[0] - 1) / 2.0)
+    )
+    objective = _mind_objective(
+        fixed_image, moving_image, transform, None, None, None, 1, 2
+    )
+    true_pose = np.array([-np.deg2rad(12.0), 0.0, 0.0])
+    true_loss, _ = objective(true_pose)
+    identity_loss, _ = objective(np.zeros(3))
+    assert true_loss < identity_loss * 0.85
+
+    result = SimpleITKRegistrar().register_complex(
+        fixed,
+        None,
+        moving,
+        None,
+        _config(
+            metric="mind",
+            transform_kind="rigid",
+            iterations=30,
+            shrink_factors=(1,),
+            smoothing_sigmas=(0.0,),
+        ),
+    )
+
+    assert result.succeeded
+    assert result.metric_name == "MIND"
+    assert result.iterations <= 30
+    assert mind_distance(fixed, result.warped_real) < before
+    assert np.degrees(result.transform.GetAngle()) == pytest.approx(-12.0, abs=1.5)
+    translation = result.transform.GetTranslation()
+    assert abs(translation[0]) < 1.0
+    assert abs(translation[1]) < 1.0
+
+
+def test_mind_iteration_budget_is_shared_by_the_two_solves():
+    assert _iteration_budgets(1, True) == (1, 0)
+    assert _iteration_budgets(5, True) == (2, 3)
+    assert _iteration_budgets(5, False) == (0, 5)
+    assert _iteration_budgets(0, True) == (0, 0)
+
+    fixed = _phantom((32, 32))
+    moving = _resample_euler(fixed, translation=(3.0, -2.0))
+    result = SimpleITKRegistrar().register_complex(
+        fixed,
+        None,
+        moving,
+        None,
+        _config(
+            metric="mind",
+            transform_kind="rigid",
+            iterations=5,
+            convergence_min_value=0.0,
+            shrink_factors=(1,),
+            smoothing_sigmas=(0.0,),
+        ),
+    )
+
+    assert result.succeeded
+    assert result.iterations <= 5
+    assert "translation" in result.stop_condition
+
+
+def test_mind_descriptor_matches_the_inr_definition_in_3d():
+    from mvc.models.inr_registration import mind_descriptor as inr_mind
+
+    size = 12
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    image = np.exp(-((z - 4.0) ** 2 + (y - 7.0) ** 2 + (x - 5.0) ** 2) / 8.0)
+    image += 0.4 * np.exp(-((z - 8.0) ** 2 + (y - 3.0) ** 2 + (x - 6.0) ** 2) / 5.0)
+    descriptor = mind_descriptor(image)
+
+    assert descriptor.shape[-1] == 26
+    np.testing.assert_allclose(descriptor, inr_mind(image), atol=1e-8)
+    np.testing.assert_allclose(mind_descriptor(image + 9.0), descriptor, atol=1e-8)
+
+
+def test_mind_chain_rule_matches_rigid_of_bspline_in_3d():
+    image = sitk.GetImageFromArray(np.zeros((12, 12, 12), dtype=np.float64))
+    rigid = sitk.Euler3DTransform()
+    rigid.SetCenter((5.5, 5.5, 5.5))
+    rigid.SetParameters((0.2, -0.15, 0.1, 0.4, -0.3, 0.2))
+    bspline = sitk.BSplineTransformInitializer(image, [2, 2, 2])
+    base = np.random.default_rng(2).normal(
+        scale=0.15, size=bspline.GetNumberOfParameters()
+    )
+    bspline.SetParameters(tuple(float(value) for value in base))
+    point = (3.0, 7.5, 4.25)
+    fixed_point = np.array([point])
+    inner = np.array([bspline.TransformPoint(point)])
+    analytical = np.zeros((3, base.size))
+    for axis in range(3):
+        upstream = np.zeros((1, 3))
+        upstream[0, axis] = 1.0
+        pulled = _pull_through_outer(rigid, inner, upstream)
+        analytical[axis] = _parameter_gradient(bspline, fixed_point, pulled)
+
+    def composed(theta):
+        bspline.SetParameters(tuple(float(value) for value in theta))
+        mapped = bspline.TransformPoint(point)
+        return np.array(rigid.TransformPoint(mapped))
+
+    step = 1e-5
+    chosen = np.linspace(0, base.size - 1, 12, dtype=int)
+    finite = np.zeros((3, chosen.size))
+    for column, index in enumerate(chosen):
+        plus = np.array(base, copy=True)
+        minus = np.array(base, copy=True)
+        plus[index] += step
+        minus[index] -= step
+        finite[:, column] = (composed(plus) - composed(minus)) / (2.0 * step)
+    bspline.SetParameters(tuple(float(value) for value in base))
+    np.testing.assert_allclose(
+        analytical[:, chosen], finite, atol=1e-5, rtol=1e-4
+    )
+
+
+def test_vectorized_transform_matches_simpleitk_pointwise():
+    euler = sitk.Euler2DTransform()
+    euler.SetCenter((1.5, -2.0))
+    euler.SetParameters((0.3, 0.4, -0.7))
+    euler3 = sitk.Euler3DTransform()
+    euler3.SetCenter((1.0, -2.0, 0.5))
+    euler3.SetParameters((0.2, -0.1, 0.35, 0.3, -0.4, 0.5))
+    affine = sitk.AffineTransform(3)
+    affine.SetCenter((0.5, -1.0, 2.0))
+    matrix = np.eye(3) + np.array(
+        [[0.1, -0.05, 0.0], [0.02, -0.08, 0.04], [0.0, 0.03, 0.06]]
+    )
+    affine.SetParameters(tuple(matrix.ravel().tolist()) + (0.2, -0.3, 0.4))
+    image = _mind_image(np.zeros((16, 14, 12)), spacing=(1.5, 2.0, 1.25))
+    bspline = sitk.BSplineTransformInitializer(image, [2, 2, 2])
+    rng = np.random.default_rng(4)
+    bspline.SetParameters(
+        tuple(
+            float(value)
+            for value in rng.normal(scale=0.3, size=bspline.GetNumberOfParameters())
+        )
+    )
+    points = {
+        euler: np.array([[0.2, 1.0], [3.0, -1.5], [1.5, -2.0]]),
+        euler3: np.array([[0.2, 1.0, 0.0], [3.0, -1.5, 2.0], [1.0, -2.0, 0.5]]),
+        affine: np.array([[0.0, 0.0, 0.0], [1.5, -0.4, 2.2]]),
+        bspline: np.array(
+            [
+                image.TransformContinuousIndexToPhysicalPoint((2.2, 3.5, 4.0)),
+                image.TransformContinuousIndexToPhysicalPoint((0.0, 0.0, 0.0)),
+                image.TransformContinuousIndexToPhysicalPoint((15.0, 13.0, 11.0)),
+                (-40.0, -40.0, -40.0),
+            ]
+        ),
+    }
+    for transform, samples in points.items():
+        got = _apply_transform(transform, samples)
+        expected = np.array(
+            [transform.TransformPoint(tuple(float(value) for value in point)) for point in samples]
+        )
+        np.testing.assert_allclose(got, expected, atol=1e-9, rtol=1e-9)
+
+
+def test_mind_accepts_a_singleton_axis():
+    fixed = np.zeros((1, 14, 14))
+    fixed[0, 4:9, 3:8] = 1.0
+    moving = np.roll(fixed, 1, axis=2)
+    result = SimpleITKRegistrar().register_complex(
+        fixed,
+        None,
+        moving,
+        None,
+        RegistrationConfig(
+            metric="mind",
+            transform_kind="rigid",
+            random_seed=1234,
+            iterations=4,
+            shrink_factors=(1,),
+            smoothing_sigmas=(0.0,),
+            sampling_percentage=0.2,
+        ),
+    )
+
+    assert result.succeeded
+    assert result.metric_name == "MIND"
+    assert np.isfinite(result.final_metric)

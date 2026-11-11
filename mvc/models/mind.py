@@ -24,15 +24,29 @@ Two defaults are fixed:
 
 * ``MIND_SAMPLE_STRIDE = 2``.  A radius-1 stencil already overlaps every
   adjacent voxel, so neighbouring descriptors are redundant.  Taking every
-  second voxel leaves one sample inside each stencil and cuts the 2D cost by
-  four (eight in 3D).  The Mattes 10% random draw is the wrong sampler here:
-  it can miss a structure smaller than the draw, and it would import
-  SimpleITK's wall-clock seed into a metric that is otherwise deterministic.
+  second voxel leaves one sample inside each interior stencil and cuts the
+  2D cost by four (eight in 3D).  The lattice is inset by the radius, so the
+  last row and column on the high-index side can fall outside every stencil;
+  that rim is the extrapolated border the distance does not score.  A stride
+  larger than ``2 * radius + 1`` can miss a stencil entirely.  The Mattes
+  10% random draw is the wrong sampler here: it can miss a structure smaller
+  than the draw, and it would import SimpleITK's wall-clock seed into a
+  metric that is otherwise deterministic.
 
 ``MIND_SIGMA = 0.5`` is not a third knob.  It is the one-voxel Gaussian on
 the squared differences: wide enough that one noisy voxel does not dominate
 the stencil, and narrow enough that it does not turn radius 1 into a larger
 pattern.
+
+The moving descriptor is rebuilt after the moving image is warped onto the
+fixed grid.  Neighbour directions are therefore always the fixed voxel
+axes, including under rotation; resampling a precomputed moving descriptor
+would compare a rotated stencil with an unrotated one.  The warp is linear
+(``map_coordinates`` order 1, nearest outside the image) and the analytic
+gradient is the slope of that same interpolant.  It is not a full-volume
+``np.gradient`` of the descriptor: that field is both the wrong derivative
+of the loss and large enough to exhaust memory on an ordinary 3D volume.
+A singleton axis has slope zero because nearest lookup collapses it.
 
 The image pyramid is not applied.  ``MIND_RADIUS`` is defined on the original
 voxel grid; shrinking the image first would silently change which tissue the
@@ -45,9 +59,8 @@ from dataclasses import dataclass
 
 import numpy as np
 import SimpleITK as sitk
-from scipy.ndimage import gaussian_filter, map_coordinates
+from scipy.ndimage import gaussian_filter
 from scipy.optimize import minimize
-
 
 MIND_RADIUS = 1
 MIND_SAMPLE_STRIDE = 2
@@ -72,13 +85,17 @@ def mind_descriptor(
 
     Each voxel is compared with the Chebyshev neighbourhood of ``radius``.
     Distances are Gaussian-smoothed squared differences.  Subtracting the
-    per-voxel minimum and dividing by the mean makes a global map
-    ``I -> a*I + b`` (``a != 0``) cancel, which is why a pure intensity
-    offset leaves the descriptor unchanged.  The result sums to one along
-    the neighbour axis.
+    per-voxel minimum and dividing by the mean of those centered distances
+    over the whole volume makes a global map ``I -> a*I + b`` (``a != 0``)
+    cancel, which is why a pure intensity offset leaves the descriptor
+    unchanged.  The result sums to one along the neighbour axis.
 
-    This is the same definition as the INR module's descriptor.  It is
-    duplicated so the SimpleITK path does not import the INR registrar.
+    The divisor is that one global mean, not the per-voxel neighbour mean
+    in Heinrich et al. 2012.  A bright structure anywhere rescales every
+    voxel together.  This is intentional: it is the same formula as the
+    INR descriptor, and this path must not fork that definition.  The INR
+    optimizer itself is not used here; the formula is duplicated so the
+    SimpleITK registrar does not import it.
     """
 
     array = np.asarray(image, dtype=float)
@@ -94,13 +111,9 @@ def mind_descriptor(
     offsets = _neighbour_offsets(array.ndim, int(radius))
     distances = np.empty(array.shape + (len(offsets),), dtype=float)
     for index, offset in enumerate(offsets):
-        shifted = map_coordinates(
-            array,
-            _offset_coordinates(array.shape, offset),
-            order=1,
-            mode="nearest",
-            prefilter=False,
-        ).reshape(array.shape)
+        # Integer offsets make linear interpolation a nearest shift.  The
+        # same shift is what the analytic gradient inverts.
+        shifted = _shift_nearest(array, offset)
         distances[..., index] = gaussian_filter(
             np.square(array - shifted), sigma=float(sigma), mode="nearest"
         )
@@ -120,10 +133,14 @@ def mind_distance(
 
     Samples are the same stride-``sample_stride`` lattice the registrar
     optimizes, inset by ``radius`` so the stencil is not scored on the
-    extrapolated rim.  Zero means the sampled self-similarity agrees,
-    including the case where one image is a global intensity shift of the
-    other.  A spatial misalignment increases it.  This compares arrays that
-    already share a grid; it does not estimate a transform.
+    extrapolated rim.  The inset is ``[radius, size - radius)``, so the
+    high-index edge itself is outside every sample's stencil.  A stride
+    greater than ``2 * radius + 1`` can leave an interior stencil with no
+    sample at all; the distance then only sees the coarser lattice.
+    Zero means the sampled self-similarity agrees, including the case where
+    one image is a global intensity shift of the other.  A spatial
+    misalignment increases it.  This compares arrays that already share a
+    grid; it does not estimate a transform.
     """
 
     if int(sample_stride) < 1:
@@ -165,92 +182,50 @@ def optimize_mind(
     Masks, when set, choose the sample lattice once from the initial
     transform.  Rebuilding the lattice every iteration would make the
     objective jump as voxels cross the mask boundary.  ``None`` uses the
-    stride lattice alone.
+    stride lattice alone.  A large initial misalignment can put the true
+    overlap outside the moving mask; sampling then raises ``ValueError``
+    (``MIND sampling mask removed every voxel``) and the registration
+    fails instead of drifting.
+
+    ``iterations`` is the total budget for this call, not a per-phase
+    budget.  Rigid and affine may spend half of it (rounded down) on a
+    translation warm-up and give whatever is left to the full solve.
+    The warm-up takes steps of at most two physical units so it cannot
+    jump the translation basin; the full solve is L-BFGS-B.  One
+    iteration is available only to the warm-up.  A B-spline has no
+    translation block and spends the whole budget on its single solve.
+    The reported iteration count is the sum of the phases, so it does not
+    exceed ``iterations``.  ``convergence`` is both the ``ftol`` and the
+    projected-gradient tolerance (``gtol``, Fortran's ``pgtol``) of L-BFGS-B.
 
     The pyramid is intentionally not used: ``radius`` stays in input voxels.
     """
 
-    fixed = sitk.GetArrayFromImage(fixed_image)
-    moving = sitk.GetArrayFromImage(moving_image)
-    if fixed.shape != moving.shape:
-        raise ValueError("MIND requires fixed and moving images of the same shape")
-    fixed_desc = mind_descriptor(fixed, radius=radius)
-    moving_desc = mind_descriptor(moving, radius=radius)
-    moving_gradient = _descriptor_gradient(moving_desc)
-    points, reference = _sample_points(
+    initial = np.array(transform.GetParameters(), dtype=float)
+    objective = _mind_objective(
         fixed_image,
         moving_image,
-        fixed_desc,
         transform,
         moving_initial_transform,
-        _mask_array(fixed_mask),
-        _mask_array(moving_mask),
+        fixed_mask,
+        moving_mask,
         int(radius),
         int(sample_stride),
     )
-    _, du_dp = _geometry(moving_image)
-    channels = moving_desc.shape[-1]
     # Line search can step to a pose whose gradient is exactly zero because
     # every sample has left the image, then stop there even though an
     # earlier pose was better.  Remember every finite evaluation.
     best_loss = np.inf
-    best_theta = np.array(transform.GetParameters(), dtype=float)
+    best_theta = np.array(initial, copy=True)
 
     def evaluate(theta):
         nonlocal best_loss, best_theta
-        theta = np.asarray(theta, dtype=float).reshape(-1)
-        transform.SetParameters(_as_tuple(theta))
-        # Free transform is inner.  The moving initial, when present, is
-        # the outer map: moving_initial(transform(point)).
-        inner = _apply_transform(transform, points)
-        moved = _apply_transform(moving_initial_transform, inner)
-        moving_index = _physical_to_index(moved, du_dp, moving_image)
-        sampled = _sample_channels(moving_desc, moving_index)
-        flat_gradient = moving_gradient.reshape(moving_desc.shape[:-1] + (-1,))
-        sampled_gradient = _sample_channels(flat_gradient, moving_index).reshape(
-            points.shape[0], channels, points.shape[1]
-        )
-        upper = np.array(moving_image.GetSize(), dtype=float) - 1.0
-        outside = (moving_index < 0.0) | (moving_index > upper)
-        sampled_gradient = np.where(outside[:, None, :], 0.0, sampled_gradient)
-        delta = sampled - reference
-        # Past the border the descriptor is clamped, so its spatial gradient
-        # is zero and a far pose looks stationary.  Count how far each index
-        # is past the border; that term is zero for every in-image sample.
-        depth = np.maximum(-moving_index, 0.0) + np.maximum(
-            moving_index - upper, 0.0
-        )
-        signed = np.where(
-            moving_index < 0.0,
-            moving_index,
-            np.where(moving_index > upper, moving_index - upper, 0.0),
-        )
-        # Small weight: a one-voxel overhang must not swamp the descriptor
-        # gradient, while a pose tens of voxels outside still dominates.
-        penalty = 1e-3 * float(np.mean(np.sum(np.square(depth), axis=1)))
-        loss = float(np.mean(np.sum(np.square(delta), axis=1))) + penalty
-        d_loss_d_index = (2.0 / delta.shape[0]) * np.einsum(
-            "nc,ncd->nd", delta, sampled_gradient
-        )
-        d_loss_d_index += (2.0 * 1e-3 / delta.shape[0]) * signed
-        d_loss_d_point = d_loss_d_index @ du_dp
-        d_loss_d_inner = _pull_through_outer(
-            moving_initial_transform, inner, d_loss_d_point
-        )
-        gradient = _parameter_gradient(transform, points, d_loss_d_inner)
-        if gradient.shape != (theta.shape[0],):
-            raise RuntimeError(
-                f"MIND gradient shape {gradient.shape} does not match "
-                f"{theta.shape[0]} parameters"
-            )
-        if not np.isfinite(loss) or not np.all(np.isfinite(gradient)):
-            raise FloatingPointError("MIND objective became non-finite")
+        loss, gradient = objective(theta)
         if loss < best_loss:
             best_loss = loss
-            best_theta = np.array(theta, copy=True)
+            best_theta = np.array(theta, dtype=float, copy=True)
         return loss, gradient
 
-    initial = np.array(transform.GetParameters(), dtype=float)
     if int(iterations) < 1:
         initial_loss, _ = evaluate(initial)
         transform.SetParameters(_as_tuple(initial))
@@ -264,27 +239,41 @@ def optimize_mind(
     # component points into a shallow basin and L-BFGS never reaches the
     # translation that actually aligns the descriptor.  Solving the
     # translation with the linear part held fixed finds that basin; the
-    # second solve is then free to add rotation or affine shear.
+    # second solve is then free to add rotation or affine shear.  The two
+    # phases share ``iterations`` so a caller-configured maximum is the
+    # maximum.
     notes = []
     used_iterations = 0
     theta = initial
     translation = _translation_parameter_slice(transform)
-    if translation is not None:
-        offset, value, used, message = _lbfgs(
+    warm_budget, _ = _iteration_budgets(int(iterations), translation is not None)
+    value = None
+    # The translation basin is narrow once the descriptor is built on the
+    # warped image.  L-BFGS-B's first step is long enough to jump over it.
+    # Walk at most two physical units per warm-up step, then give every
+    # unused iteration to the full solve.  The two phases together stay
+    # inside ``iterations``.
+    if translation is not None and warm_budget > 0:
+        offset, value, used, message = _capped_descent(
             _translation_objective(evaluate, theta, translation),
             theta[translation],
-            iterations,
-            convergence,
+            warm_budget,
+            max_step=2.0,
         )
         theta = np.array(theta, copy=True)
         theta[translation] = offset
         used_iterations += used
         notes.append(f"translation {message}")
-    theta, value, used, message = _lbfgs(
-        evaluate, theta, iterations, convergence
-    )
-    used_iterations += used
-    notes.append(message)
+    full_budget = int(iterations) - used_iterations
+    if full_budget > 0:
+        theta, value, used, message = _lbfgs(
+            evaluate, theta, full_budget, convergence
+        )
+        used_iterations += used
+        notes.append(message)
+    elif value is None:
+        value, _ = evaluate(theta)
+        notes.append("full solve skipped: iteration budget spent on translation")
     if best_loss + 1e-12 < value:
         theta = best_theta
         value = best_loss
@@ -326,9 +315,67 @@ def _translation_objective(evaluate, full_parameters, translation):
     return objective
 
 
+def _capped_descent(objective, start, steps, max_step):
+    """Gradient steps whose length is at most ``max_step``.
+
+    Backtracking shortens the step when it does not decrease the loss.
+    Each accepted step counts as one iteration.  Returns the same tuple
+    shape as ``_lbfgs``.
+    """
+
+    theta = np.array(start, dtype=float, copy=True)
+    value, gradient = objective(theta)
+    used = 0
+    message = "step limit reached"
+    for _ in range(int(steps)):
+        grad_norm = float(np.linalg.norm(gradient))
+        if not np.isfinite(grad_norm) or grad_norm < 1e-12:
+            message = "gradient vanished"
+            break
+        direction = -np.asarray(gradient, dtype=float) / grad_norm
+        length = float(max_step)
+        accepted = False
+        for _attempt in range(12):
+            trial = theta + length * direction
+            trial_value, trial_gradient = objective(trial)
+            if trial_value < value - 1e-12:
+                theta = np.asarray(trial, dtype=float)
+                value = float(trial_value)
+                gradient = np.asarray(trial_gradient, dtype=float)
+                accepted = True
+                used += 1
+                break
+            length *= 0.5
+        if not accepted:
+            message = "line search failed"
+            break
+    return theta, float(value), used, message
+
+
+def _iteration_budgets(iterations, has_translation_phase):
+    """Split one caller budget across the warm-up and the full solve.
+
+    The warm-up gets half, rounded down, and at least the only iteration
+    when the budget is 1.  The two ``maxiter`` values sum to ``iterations``.
+    """
+
+    iterations = int(iterations)
+    if iterations < 1:
+        return 0, 0
+    if not has_translation_phase:
+        return 0, iterations
+    if iterations == 1:
+        return 1, 0
+    warm = iterations // 2
+    return warm, iterations - warm
+
+
 def _lbfgs(evaluate, start, iterations, convergence):
     # Copy: L-BFGS may write into the vector it was given, and a rejected
     # step must still be able to restore this start.
+    # ``convergence`` is both the function tolerance and the projected
+    # gradient tolerance.  Leaving ``pgtol`` at SciPy's default would let a
+    # different threshold stop the solve than the one the caller set.
     start = np.array(start, dtype=float, copy=True)
     start_loss, _ = evaluate(start)
     result = minimize(
@@ -338,7 +385,9 @@ def _lbfgs(evaluate, start, iterations, convergence):
         method="L-BFGS-B",
         options={
             "maxiter": int(iterations),
-            "ftol": float(convergence),
+            # SciPy names the projected-gradient tolerance ``gtol``.
+            # The Fortran solver calls the same threshold ``pgtol``.
+            "gtol": float(convergence),
         },
     )
     final = np.asarray(result.x, dtype=float)
@@ -642,7 +691,7 @@ def _sample_points(
     points = _index_to_physical(index_xyz, fixed_image)
     reference = fixed_desc[tuple(rows.T)]
     if moving_mask is None:
-        return points, reference
+        return points, reference, rows
     if moving_mask.shape != fixed_desc.shape[:-1]:
         raise ValueError("moving MIND mask shape does not match the image")
     initial_inner = _apply_transform(transform, points)
@@ -658,7 +707,7 @@ def _sample_points(
         keep[inside] = moving_mask[tuple(nearest[inside].T)] > 0
     if not np.any(keep):
         raise ValueError("MIND sampling mask removed every voxel")
-    return points[keep], reference[keep]
+    return points[keep], reference[keep], rows[keep]
 
 
 def _sample_rows(shape, radius: int, sample_stride: int) -> np.ndarray:
@@ -679,35 +728,322 @@ def _sample_rows(shape, radius: int, sample_stride: int) -> np.ndarray:
     return np.stack([item.ravel() for item in mesh], axis=1)
 
 
-def _descriptor_gradient(descriptor: np.ndarray) -> np.ndarray:
-    """Central ``d(descriptor)/d(index)`` in SimpleITK axis order (x, y, z)."""
-
-    spatial = descriptor.ndim - 1
-    grads = [
-        np.gradient(descriptor, axis=axis)
-        if descriptor.shape[axis] > 1
-        else np.zeros_like(descriptor)
-        for axis in range(spatial)
-    ]
-    ordered = [grads[spatial - 1 - axis] for axis in range(spatial)]
-    return np.stack(ordered, axis=-1)
+# Points per objective chunk.  The descriptor itself stays a full volume;
+# the gradient does not.  8192 keeps the per-chunk temporaries small on a
+# clinical lattice (a 256³ stride-2 grid is a few million points).
+_OBJECTIVE_CHUNK = 8192
 
 
-def _sample_channels(volume: np.ndarray, index_xyz: np.ndarray) -> np.ndarray:
-    """Linear sample of a ``(..., channels)`` array at SimpleITK indices."""
+def _mind_objective(
+    fixed_image,
+    moving_image,
+    transform,
+    moving_initial_transform,
+    fixed_mask,
+    moving_mask,
+    radius,
+    sample_stride,
+):
+    """Return ``(loss, d(loss)/d(parameters))`` for one pose of ``transform``.
 
-    channels = volume.shape[-1]
-    coordinates = np.asarray(index_xyz, dtype=float)[:, ::-1].T
-    sampled = np.empty((coordinates.shape[1], channels), dtype=volume.dtype)
-    for channel in range(channels):
-        sampled[:, channel] = map_coordinates(
-            volume[..., channel],
-            coordinates,
-            order=1,
-            mode="nearest",
-            prefilter=False,
+    The callable writes ``transform``'s parameters.  The moving image is
+    warped onto the fixed grid and the descriptor is computed there, so
+    both stencils use the fixed voxel directions.
+    """
+
+    fixed = sitk.GetArrayFromImage(fixed_image)
+    moving = sitk.GetArrayFromImage(moving_image)
+    if fixed.shape != moving.shape:
+        raise ValueError("MIND requires fixed and moving images of the same shape")
+    fixed_desc = mind_descriptor(fixed, radius=radius)
+    _, reference, rows = _sample_points(
+        fixed_image,
+        moving_image,
+        fixed_desc,
+        transform,
+        moving_initial_transform,
+        _mask_array(fixed_mask),
+        _mask_array(moving_mask),
+        int(radius),
+        int(sample_stride),
+    )
+    all_rows = np.stack(
+        [item.ravel() for item in np.meshgrid(
+            *[np.arange(size) for size in fixed.shape], indexing="ij"
+        )],
+        axis=1,
+    )
+    all_points = _index_to_physical(all_rows[:, ::-1].astype(float), fixed_image)
+    sample_flat = np.ravel_multi_index(tuple(rows.T), fixed.shape)
+    _, du_dp = _geometry(moving_image)
+    count = rows.shape[0]
+    upper = np.array(moving_image.GetSize(), dtype=float) - 1.0
+    sigma = MIND_SIGMA
+
+    def objective(theta):
+        theta = np.asarray(theta, dtype=float).reshape(-1)
+        transform.SetParameters(_as_tuple(theta))
+        warped, slope, inner, moving_index = _warp_moving(
+            moving, moving_image, transform, moving_initial_transform, all_points, du_dp
         )
-    return sampled
+        warped = warped.reshape(fixed.shape)
+        moving_desc = mind_descriptor(warped, radius=radius, sigma=sigma)
+        delta = moving_desc[tuple(rows.T)] - reference
+        # Nearest extrapolation clamps each axis on its own.  The depth
+        # term is what keeps a pose that has left the image from looking
+        # stationary once the descriptor slope has collapsed.
+        sample_index = moving_index[sample_flat]
+        depth = np.maximum(-sample_index, 0.0) + np.maximum(
+            sample_index - upper, 0.0
+        )
+        signed = np.where(
+            sample_index < 0.0,
+            sample_index,
+            np.where(sample_index > upper, sample_index - upper, 0.0),
+        )
+        penalty = 1e-3 * float(np.mean(np.sum(np.square(depth), axis=1)))
+        loss = float(np.mean(np.sum(np.square(delta), axis=1))) + penalty
+        d_descriptor = np.zeros_like(moving_desc)
+        d_descriptor[tuple(rows.T)] = (2.0 / count) * delta
+        d_warped = _mind_image_gradient(warped, d_descriptor, radius, sigma)
+        gradient = _warp_parameter_gradient(
+            d_warped.reshape(-1),
+            slope,
+            inner,
+            all_points,
+            du_dp,
+            transform,
+            moving_initial_transform,
+        )
+        d_penalty_d_index = (2.0 * 1e-3 / count) * signed
+        d_penalty_d_point = d_penalty_d_index @ du_dp
+        d_penalty_d_inner = _pull_through_outer(
+            moving_initial_transform, inner[sample_flat], d_penalty_d_point
+        )
+        gradient = gradient + _parameter_gradient(
+            transform, all_points[sample_flat], d_penalty_d_inner
+        )
+        if gradient.shape != (theta.shape[0],):
+            raise RuntimeError(
+                f"MIND gradient shape {gradient.shape} does not match "
+                f"{theta.shape[0]} parameters"
+            )
+        if not np.isfinite(loss) or not np.all(np.isfinite(gradient)):
+            raise FloatingPointError("MIND objective became non-finite")
+        return float(loss), gradient
+
+    return objective
+
+
+def _warp_moving(moving, moving_image, transform, outer, points, du_dp):
+    inner = _apply_transform(transform, points)
+    moved = _apply_transform(outer, inner)
+    moving_index = _physical_to_index(moved, du_dp, moving_image)
+    values = np.empty(points.shape[0], dtype=float)
+    slope = np.empty_like(points, dtype=float)
+    volume = np.ascontiguousarray(moving)[..., None]
+    for start, stop in _point_chunks(points.shape[0]):
+        sampled, sampled_slope = _sample_linear_channels(
+            volume, moving_index[start:stop]
+        )
+        values[start:stop] = sampled[:, 0]
+        slope[start:stop] = sampled_slope[:, 0, :]
+    return values, slope, inner, moving_index
+
+
+def _warp_parameter_gradient(
+    d_values, slope, inner, points, du_dp, transform, outer
+):
+    gradient = np.zeros(int(transform.GetNumberOfParameters()), dtype=float)
+    for start, stop in _point_chunks(points.shape[0]):
+        d_index = d_values[start:stop, None] * slope[start:stop]
+        d_point = d_index @ du_dp
+        d_inner = _pull_through_outer(outer, inner[start:stop], d_point)
+        gradient += _parameter_gradient(transform, points[start:stop], d_inner)
+    return gradient
+
+
+def _mind_image_gradient(image, d_descriptor, radius, sigma):
+    """``d(loss)/d(image)`` for a descriptor loss, matching ``mind_descriptor``."""
+
+    array = np.asarray(image, dtype=float)
+    offsets = _neighbour_offsets(array.ndim, int(radius))
+    kernel = _gaussian_kernel(float(sigma))
+    distances = np.empty(array.shape + (len(offsets),), dtype=float)
+    shifted_images = []
+    for index, offset in enumerate(offsets):
+        shifted = _shift_nearest(array, offset)
+        shifted_images.append(shifted)
+        distances[..., index] = gaussian_filter(
+            np.square(array - shifted), sigma=float(sigma), mode="nearest"
+        )
+    centered = distances - np.min(distances, axis=-1, keepdims=True)
+    scale = float(np.mean(centered)) + 1e-8
+    weights = np.exp(-centered / scale)
+    norm = np.sum(weights, axis=-1, keepdims=True) + 1e-12
+    descriptor = weights / norm
+
+    upstream = np.asarray(d_descriptor, dtype=float)
+    dot = np.sum(upstream * descriptor, axis=-1, keepdims=True)
+    d_weights = (upstream - dot) / norm
+    d_scale = float(np.sum(d_weights * weights * centered / (scale**2)))
+    d_centered = d_weights * (-weights / scale)
+    d_centered = d_centered + (d_scale / centered.size)
+    d_distances = np.array(d_centered, copy=True)
+    sum_d_centered = np.sum(d_centered, axis=-1)
+    argmin = np.argmin(distances, axis=-1)
+    d_distances[(*np.indices(argmin.shape), argmin)] -= sum_d_centered
+
+    d_array = np.zeros_like(array)
+    for index, offset in enumerate(offsets):
+        d_square = _gaussian_adjoint(d_distances[..., index], kernel)
+        diff = array - shifted_images[index]
+        d_diff = d_square * (2.0 * diff)
+        d_array += d_diff
+        d_array += _shift_nearest_adjoint(-d_diff, array.shape, offset)
+    return d_array
+
+
+def _gaussian_kernel(sigma, truncate=4.0):
+    radius = int(truncate * float(sigma) + 0.5)
+    positions = np.arange(-radius, radius + 1, dtype=float)
+    kernel = np.exp(-0.5 * (positions / float(sigma)) ** 2)
+    kernel /= np.sum(kernel)
+    return kernel
+
+
+def _gaussian_adjoint(upstream, kernel):
+    """Adjoint of ``gaussian_filter(..., mode='nearest')`` for this kernel."""
+
+    gradient = np.asarray(upstream, dtype=float)
+    for axis in reversed(range(gradient.ndim)):
+        gradient = _gaussian_axis_adjoint(gradient, kernel, axis)
+    return gradient
+
+
+def _gaussian_axis_adjoint(upstream, kernel, axis):
+    radius = len(kernel) // 2
+    length = upstream.shape[axis]
+    positions = np.arange(length)
+    gradient = np.zeros_like(upstream)
+    moved = np.moveaxis(gradient, axis, 0)
+    for shift, weight in zip(range(-radius, radius + 1), kernel):
+        source = np.clip(positions + shift, 0, length - 1)
+        np.add.at(moved, source, weight * np.moveaxis(upstream, axis, 0))
+    return gradient
+
+
+def _shift_nearest(array, offset):
+    """``array[clip(index + offset)]``, matching integer ``map_coordinates``."""
+
+    shifted = array
+    for axis, shift in enumerate(offset):
+        length = shifted.shape[axis]
+        source = np.clip(np.arange(length) + int(shift), 0, length - 1)
+        shifted = np.take(shifted, source, axis=axis)
+    return shifted
+
+
+def _shift_nearest_adjoint(upstream, shape, offset):
+    gradient = np.asarray(upstream, dtype=float)
+    for axis in reversed(range(len(offset))):
+        length = shape[axis]
+        source = np.clip(np.arange(length) + int(offset[axis]), 0, length - 1)
+        scattered = np.zeros_like(gradient)
+        np.add.at(np.moveaxis(scattered, axis, 0), source, np.moveaxis(gradient, axis, 0))
+        gradient = scattered
+    return gradient
+
+
+def _point_chunks(count, size=_OBJECTIVE_CHUNK):
+    start = 0
+    while start < count:
+        stop = min(count, start + size)
+        yield start, stop
+        start = stop
+
+
+def _sample_linear_channels(volume, index_xyz):
+    """Values and exact linear slope at SimpleITK indices.
+
+    ``volume`` is ``(..., channels)`` in NumPy axis order.  The slope is
+    ``d(value)/d(index_xyz)`` of ``map_coordinates(..., order=1,
+    mode="nearest")``: along the differentiated axis it is the forward
+    difference of the cell that contains the coordinate, and the other
+    axes stay linear.  Nearest lookup makes an out-of-range axis (and any
+    singleton axis) contribute slope zero without clearing the axes that
+    are still inside the image.
+    """
+
+    spatial = volume.shape[:-1]
+    coords = np.asarray(index_xyz, dtype=float)[:, ::-1]
+    dimension = coords.shape[1]
+    if len(spatial) != dimension:
+        raise ValueError(
+            f"MIND sample dimension {dimension} does not match volume {spatial}"
+        )
+    count = coords.shape[0]
+    floors = np.floor(coords).astype(np.int64)
+    fracs = coords - floors
+    sizes = np.asarray(spatial, dtype=np.int64)
+    channels = volume.shape[-1]
+
+    def gather(index):
+        clipped = np.clip(index, 0, sizes - 1)
+        return volume[tuple(clipped.T)]
+
+    values = np.zeros((count, channels), dtype=float)
+    for mask in range(1 << dimension):
+        weight = np.ones(count, dtype=float)
+        index = np.empty((count, dimension), dtype=np.int64)
+        for axis in range(dimension):
+            bit = (mask >> axis) & 1
+            fraction = fracs[:, axis]
+            weight *= fraction if bit else (1.0 - fraction)
+            index[:, axis] = floors[:, axis] + bit
+        values += weight[:, None] * gather(index)
+
+    gradient_numpy = np.zeros((count, channels, dimension), dtype=float)
+    for axis in range(dimension):
+        others = [item for item in range(dimension) if item != axis]
+        diff = np.zeros((count, channels), dtype=float)
+        for mask in range(1 << len(others)):
+            weight = np.ones(count, dtype=float)
+            index_lo = floors.copy()
+            index_hi = floors.copy()
+            index_hi[:, axis] = floors[:, axis] + 1
+            for bit_index, other in enumerate(others):
+                bit = (mask >> bit_index) & 1
+                fraction = fracs[:, other]
+                weight *= fraction if bit else (1.0 - fraction)
+                source = floors[:, other] + bit
+                index_lo[:, other] = source
+                index_hi[:, other] = source
+            diff += weight[:, None] * (gather(index_hi) - gather(index_lo))
+        # Exactly on a voxel the two adjacent cells disagree.  Use their
+        # average there: it is the slope central differences see, and it
+        # is what a rigid start (every sample on an integer) needs in
+        # order to move toward the translation.  Inside a cell the
+        # derivative is the forward difference alone.
+        on_grid = np.isclose(fracs[:, axis], 0.0)
+        if np.any(on_grid):
+            left = np.zeros_like(diff)
+            for mask in range(1 << len(others)):
+                weight = np.ones(count, dtype=float)
+                index_lo = floors.copy()
+                index_hi = floors.copy()
+                index_lo[:, axis] = floors[:, axis] - 1
+                for bit_index, other in enumerate(others):
+                    bit = (mask >> bit_index) & 1
+                    fraction = fracs[:, other]
+                    weight *= fraction if bit else (1.0 - fraction)
+                    source = floors[:, other] + bit
+                    index_lo[:, other] = source
+                    index_hi[:, other] = source
+                left += weight[:, None] * (gather(index_hi) - gather(index_lo))
+            diff = np.where(on_grid[:, None], 0.5 * (diff + left), diff)
+        gradient_numpy[:, :, axis] = diff
+    return values, np.ascontiguousarray(gradient_numpy[:, :, ::-1])
 
 
 def _geometry(image):
@@ -736,13 +1072,129 @@ def _frame(image):
 
 
 def _apply_transform(transform, points: np.ndarray) -> np.ndarray:
-    if transform is None:
-        return np.asarray(points, dtype=float)
+    points = np.asarray(points, dtype=float)
+    if transform is None or points.shape[0] == 0:
+        return points
+    name = transform.GetName()
+    if name == "Euler2DTransform":
+        return _apply_euler2d(transform, points)
+    if name == "Euler3DTransform":
+        return _apply_euler3d(transform, points)
+    if name == "AffineTransform":
+        return _apply_affine(transform, points)
+    if name == "BSplineTransform":
+        return _apply_bspline(transform, points)
     mapped = [
         transform.TransformPoint(tuple(float(value) for value in point))
         for point in points
     ]
     return np.asarray(mapped, dtype=float)
+
+
+def _apply_centered(matrix, center, translation, points):
+    return (points - center) @ matrix.T + center + translation
+
+
+def _apply_euler2d(transform, points):
+    parameters = np.array(transform.GetParameters(), dtype=float)
+    angle = float(parameters[0])
+    cosine = float(np.cos(angle))
+    sine = float(np.sin(angle))
+    matrix = np.array([[cosine, -sine], [sine, cosine]], dtype=float)
+    center = np.array(transform.GetCenter(), dtype=float)
+    return _apply_centered(matrix, center, parameters[1:], points)
+
+
+def _apply_euler3d(transform, points):
+    matrix = _euler3d_matrix(transform)
+    parameters = np.array(transform.GetParameters(), dtype=float)
+    center = np.array(transform.GetCenter(), dtype=float)
+    return _apply_centered(matrix, center, parameters[3:], points)
+
+
+def _apply_affine(transform, points):
+    dimension = points.shape[1]
+    parameters = np.array(transform.GetParameters(), dtype=float)
+    matrix = parameters[: dimension * dimension].reshape(dimension, dimension)
+    center = np.array(transform.GetCenter(), dtype=float)
+    return _apply_centered(
+        matrix, center, parameters[dimension * dimension :], points
+    )
+
+
+def _apply_bspline(transform, points):
+    if int(transform.GetOrder()) != 3:
+        raise ValueError("MIND only evaluates the cubic SimpleITK B-spline")
+    output = np.empty_like(points, dtype=float)
+    for start, stop in _point_chunks(points.shape[0]):
+        output[start:stop] = _apply_bspline_chunk(transform, points[start:stop])
+    return output
+
+
+def _apply_bspline_chunk(transform, points):
+    dimension = points.shape[1]
+    coefficient = transform.GetCoefficientImages()[0]
+    origin = np.array(coefficient.GetOrigin(), dtype=float)
+    spacing = np.array(coefficient.GetSpacing(), dtype=float)
+    direction = np.array(coefficient.GetDirection(), dtype=float).reshape(
+        dimension, dimension
+    )
+    control = np.array(coefficient.GetSize(), dtype=int)
+    n_control = int(np.prod(control))
+    parameters = np.array(transform.GetParameters(), dtype=float).reshape(
+        dimension, n_control
+    )
+    domain_origin = np.array(transform.GetTransformDomainOrigin(), dtype=float)
+    domain_size = np.array(
+        transform.GetTransformDomainPhysicalDimensions(), dtype=float
+    )
+    domain_direction = np.array(
+        transform.GetTransformDomainDirection(), dtype=float
+    ).reshape(dimension, dimension)
+    local = (points - domain_origin) @ np.linalg.inv(domain_direction).T
+    inside = np.all((local >= 0.0) & (local < domain_size), axis=1)
+    continuous = (points - origin) @ np.linalg.inv(direction).T
+    continuous = continuous / spacing
+    support = np.floor(continuous).astype(int) - 1
+    index = support[:, :, None] + np.arange(4)[None, None, :]
+    weight = _cubic_bspline(continuous[:, :, None] - index)
+    valid = (index >= 0) & (index < control[None, :, None])
+    weight = np.where(valid, weight, 0.0)
+    weight[~inside] = 0.0
+    if dimension == 2:
+        separable = weight[:, 0, :, None] * weight[:, 1, None, :]
+        ix = index[:, 0, :, None]
+        iy = index[:, 1, None, :]
+        usable = (ix >= 0) & (ix < control[0]) & (iy >= 0) & (iy < control[1])
+        flat = np.where(usable, ix + control[0] * iy, 0)
+    elif dimension == 3:
+        separable = (
+            weight[:, 0, :, None, None]
+            * weight[:, 1, None, :, None]
+            * weight[:, 2, None, None, :]
+        )
+        ix = index[:, 0, :, None, None]
+        iy = index[:, 1, None, :, None]
+        iz = index[:, 2, None, None, :]
+        flat = ix + control[0] * (iy + control[1] * iz)
+        usable = (
+            (ix >= 0)
+            & (ix < control[0])
+            & (iy >= 0)
+            & (iy < control[1])
+            & (iz >= 0)
+            & (iz < control[2])
+        )
+        flat = np.where(usable, flat, 0)
+    else:
+        raise ValueError(f"MIND B-spline does not support dimension {dimension}")
+    separable = np.where(usable, separable, 0.0)
+    flat = np.asarray(flat, dtype=int)
+    displacement = np.zeros_like(points, dtype=float)
+    axes = tuple(range(1, separable.ndim))
+    for axis in range(dimension):
+        displacement[:, axis] = np.sum(parameters[axis][flat] * separable, axis=axes)
+    return points + displacement
 
 
 def _mask_array(mask):
@@ -763,15 +1215,6 @@ def _neighbour_offsets(ndim: int, radius: int):
         for offset in stacked
         if np.any(offset)
     ]
-
-
-def _offset_coordinates(shape, offset) -> np.ndarray:
-    axes = [
-        np.arange(size, dtype=float) + shift
-        for size, shift in zip(shape, offset, strict=True)
-    ]
-    mesh = np.meshgrid(*axes, indexing="ij")
-    return np.stack([item.ravel() for item in mesh], axis=0)
 
 
 def _cubic_bspline(distance: np.ndarray) -> np.ndarray:
