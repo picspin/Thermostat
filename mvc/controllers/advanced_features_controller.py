@@ -18,9 +18,13 @@ class AdvancedFeaturesController:
                  registration_config=None):
         """Initialize with references to view and models.
 
-        ``registrar`` is optional.  The sequence still does not register
-        unless the motion-correction checkbox is checked, and then it uses
-        this registrar against the first frame.
+        ``registrar`` and ``registration_config`` are optional.  The GUI
+        passes the thermometry controller's registrar and its
+        liver-respiratory config, so a checked box registers every later
+        frame to the first frame with that preset.  If the caller omits
+        the registrar, ``CinemaModel`` creates one and, when no config was
+        passed either, uses the same preset.  The sequence still does not
+        register unless the checkbox is checked.
         """
         self.view = view
         self.cinema_model = cinema_model

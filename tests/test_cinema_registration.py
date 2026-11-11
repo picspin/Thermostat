@@ -250,12 +250,113 @@ def test_stop_event_before_the_first_frame_stores_nothing():
     assert any("cancelled" in message for message in cinema.errors)
 
 
-def test_motion_correction_without_a_registrar_is_refused():
-    cinema = _cinema(RecordingModel())
+def test_cinema_uses_liver_respiratory_preset():
+    model = RecordingModel()
+    cinema = _cinema(model)
+    registrar = FrameRegistrar()
+    config = RegistrationConfig.liver_respiratory()
+
+    sequence = cinema.calculate_temperature_sequence(
+        ["r0", "r1", "r2"],
+        ["i0", "i1", "i2"],
+        apply_motion_correction=True,
+        registrar=registrar,
+        registration_config=config,
+    )
+
+    assert sequence is not None
+    used = registrar.calls[0]["config"]
+    assert used.transform_kind == "rigid_bspline"
+    assert used.metric == "ants_neighborhood_correlation"
+    assert used.mask_kind == "otsu_dilated"
+
+
+def _organ_phantom(shape=(48, 48), shift=(0, 0)):
+    y, x = np.mgrid[0 : shape[0], 0 : shape[1]]
+    image = np.zeros(shape, dtype=float)
+    image += np.exp(-((y - 18.0) ** 2 + (x - 16.0) ** 2) / 30.0)
+    image += 0.7 * np.exp(-((y - 30.0) ** 2 + (x - 32.0) ** 2) / 40.0)
+    if shift != (0, 0):
+        image = np.roll(image, shift, axis=(0, 1))
+    return image
+
+
+class PhantomSequenceModel(RecordingModel):
+    """Structured frames, so the real preset has something to align."""
+
+    def __init__(self):
+        super().__init__()
+        self.pixel_spacing_mm = (1.5, 1.5)
+        self.real1 = _organ_phantom()
+        self.imag1 = self.real1 * 0.2
+        self.real2 = _organ_phantom(shift=(3, -2))
+        self.imag2 = self.real2 * 0.2
+
+    def _load(self, name, path):
+        self.loads.append((name, path))
+        self.registration_result = None
+        if (name, path) in self.fail_loads:
+            return False
+        shift = (0, 0) if path in ("r0", "i0") else (3, -2)
+        image = _organ_phantom(shift=shift)
+        if name.startswith("imag"):
+            image = image * 0.2
+        setattr(self, name, image)
+        return True
+
+
+def test_auto_registrar_uses_the_liver_preset_and_improves_the_frame():
+    model = PhantomSequenceModel()
+    cinema = _cinema(model)
 
     sequence = cinema.calculate_temperature_sequence(
         ["r0", "r1"], ["i0", "i1"], apply_motion_correction=True
     )
 
-    assert sequence is None
-    assert cinema.errors
+    assert sequence is not None
+    assert sequence[0] is not None
+    assert model.calls[0]["use_registration"] is True
+    config = model.registration_result.config
+    assert config.transform_kind == "rigid_bspline"
+    assert config.metric == "ants_neighborhood_correlation"
+    assert config.mask_kind == "otsu_dilated"
+    assert config.dilation_mm == 12.0
+    assert model.registration_result.mae_after < model.registration_result.mae_before
+
+
+def test_a_warp_that_increases_the_error_is_not_used():
+    model = RecordingModel()
+    cinema = _cinema(model)
+    worse = RegistrationResult(
+        warped_real=np.ones((4, 4)),
+        warped_imag=np.zeros((4, 4)),
+        transform=object(),
+        config=RegistrationConfig(),
+        metric_name="MattesMutualInformation",
+        final_metric=-0.1,
+        dice=0.2,
+        iterations=3,
+        stop_condition="diverged",
+        elapsed_s=0.01,
+        status="warning",
+        message="DICE coefficient 0.200 is below 0.900",
+        mae_before=1.0,
+        mae_after=8.0,
+        folding_ratio=0.4,
+    )
+
+    class WorseRegistrar:
+        def register_complex(self, **kwargs):
+            return worse
+
+    sequence = cinema.calculate_temperature_sequence(
+        ["r0", "r1"],
+        ["i0", "i1"],
+        apply_motion_correction=True,
+        registrar=WorseRegistrar(),
+    )
+
+    assert sequence == [None]
+    assert model.calls == []
+    assert any("increased the image error" in message for message in cinema.errors)
+    assert all("/tmp/" not in message for message in cinema.errors)

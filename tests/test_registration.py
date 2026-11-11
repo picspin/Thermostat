@@ -422,6 +422,24 @@ def test_execute_failure_is_reported_in_the_result():
     assert "simulated registration failure" in result.message
 
 
+def test_nonunit_spacing_does_not_fail_the_overlap_check():
+    fixed = _phantom((32, 32))
+    moving = np.roll(fixed, (2, -1), axis=(0, 1))
+
+    result = SimpleITKRegistrar().register_complex(
+        fixed,
+        None,
+        moving,
+        None,
+        _config(iterations=3),
+        spacing_mm=(1.5, 1.5),
+    )
+
+    assert result.status != "failed"
+    assert np.isfinite(result.dice)
+    assert "physical space" not in result.message
+
+
 def test_dicom_spacing_is_stored_as_x_then_y():
     from mvc.models.thermometry_model import ThermometryModel
 
