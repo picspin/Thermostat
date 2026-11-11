@@ -697,16 +697,17 @@ def _sample_channels(volume: np.ndarray, index_xyz: np.ndarray) -> np.ndarray:
     """Linear sample of a ``(..., channels)`` array at SimpleITK indices."""
 
     channels = volume.shape[-1]
-    ordered = np.moveaxis(volume, -1, 0)
-    numpy_index = np.asarray(index_xyz, dtype=float)[:, ::-1]
-    count = numpy_index.shape[0]
-    coordinates = np.empty((1 + numpy_index.shape[1], count * channels), dtype=float)
-    coordinates[0] = np.repeat(np.arange(channels), count)
-    coordinates[1:] = np.tile(numpy_index.T, channels)
-    sampled = map_coordinates(
-        ordered, coordinates, order=1, mode="nearest", prefilter=False
-    )
-    return sampled.reshape(channels, count).T
+    coordinates = np.asarray(index_xyz, dtype=float)[:, ::-1].T
+    sampled = np.empty((coordinates.shape[1], channels), dtype=volume.dtype)
+    for channel in range(channels):
+        sampled[:, channel] = map_coordinates(
+            volume[..., channel],
+            coordinates,
+            order=1,
+            mode="nearest",
+            prefilter=False,
+        )
+    return sampled
 
 
 def _geometry(image):
