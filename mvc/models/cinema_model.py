@@ -53,6 +53,10 @@ class CinemaModel(QObject):
         super().__init__()
         self.thermometry_model = thermometry_model
         self.temperature_sequence = []
+        # Parallel to temperature_sequence.  True where that frame's voxel
+        # had enough signal to be accumulated into CEM43.  This does not
+        # change the temperature values or the registration.
+        self.validity_sequence = []
         
     def calculate_temperature_sequence(self, real_files, imag_files, original_temperature=37.0, 
                                       apply_gaussian=False, apply_b0_correction=False,
@@ -79,13 +83,20 @@ class CinemaModel(QObject):
         ``stop_event`` is optional.  When it is set, the loop stops before
         the next frame.  The frame already in progress finishes, and frames
         already stored are kept.  Leaving it unset does not change the result.
+
+        Each stored frame also keeps a copy of ``valid_temperature_mask``
+        when the thermometry model has one.  CEM43 uses that mask to skip
+        low-signal voxels.  The mask is not used by registration, and the
+        temperature values themselves are not changed.
         """
         if len(real_files) < 2 or len(imag_files) < 2:
             self.error_occurred.emit("Need at least 2 real and 2 imaginary files for sequence calculation")
             return None
         
-        # Clear previous sequence
+        # Clear previous sequence.  The validity masks are bookkeeping for
+        # CEM43; they are not part of the registration.
         self.temperature_sequence = []
+        self.validity_sequence = []
         
         # Calculate total number of pairs
         total_pairs = len(real_files) - 1
@@ -161,7 +172,7 @@ class CinemaModel(QObject):
                     )
                     rejection = _reject_registration(result)
                     if rejection is not None:
-                        self.temperature_sequence.append(None)
+                        self._record_frame(None)
                         print(
                             "Motion correction failed for frame "
                             f"{moving_index + 1}: {result.message}"
@@ -183,15 +194,15 @@ class CinemaModel(QObject):
                 )
                 
                 if success and self.thermometry_model.temperature_map is not None:
-                    self.temperature_sequence.append(self.thermometry_model.temperature_map.copy())
+                    self._record_frame(self.thermometry_model.temperature_map)
                 else:
                     # If calculation fails, add None to maintain sequence
-                    self.temperature_sequence.append(None)
+                    self._record_frame(None)
                     self.error_occurred.emit(f"Failed to calculate temperature for pair {i+1}")
             
             except Exception as e:
                 self.error_occurred.emit(f"Error processing pair {i+1}: {str(e)}")
-                self.temperature_sequence.append(None)
+                self._record_frame(None)
         
         # Emit completion signal with the sequence
         self.calculation_complete.emit(self.temperature_sequence)
@@ -201,9 +212,27 @@ class CinemaModel(QObject):
         """Load one sequence image.  Failure records this frame as missing."""
         if load(path):
             return True
-        self.temperature_sequence.append(None)
+        self._record_frame(None)
         self.error_occurred.emit(message)
         return False
+
+    def _record_frame(self, temperature_map):
+        """Store one frame and the voxels CEM43 is allowed to accumulate.
+
+        Temperature values are copied through unchanged.  The low-signal
+        mask is copied too, because the thermometry model overwrites it on
+        the next frame.  A missing mask is stored as None.
+        """
+        if temperature_map is None:
+            self.temperature_sequence.append(None)
+            self.validity_sequence.append(None)
+            return
+        self.temperature_sequence.append(np.array(temperature_map, copy=True))
+        mask = getattr(self.thermometry_model, "valid_temperature_mask", None)
+        if mask is None:
+            self.validity_sequence.append(None)
+        else:
+            self.validity_sequence.append(np.array(mask, dtype=bool, copy=True))
     
     def save_sequence_video(self, file_path, fps=2, vmin=None, vmax=None):
         """Save temperature sequence as a video file."""
@@ -314,4 +343,5 @@ class CinemaModel(QObject):
     def clear_sequence(self):
         """Clear temperature sequence to free memory."""
         self.temperature_sequence = []
+        self.validity_sequence = []
         gc.collect()  # Force garbage collection

@@ -39,6 +39,10 @@ class ThermometryModel(QObject):
         self.registration_result = None
         # SimpleITK order (column mm, row mm).  DICOM stores row first.
         self.pixel_spacing_mm = None
+        # Voxels CEM43 may accumulate.  Not a change to the temperature map:
+        # low-signal voxels are still present there, and this mask only marks
+        # them.  None until a calculation succeeds.
+        self.valid_temperature_mask = None
         
         # 创建ROI保存目录
         self.roi_save_dir = os.path.join(os.path.expanduser("~"), ".mr_thermometry", "rois")
@@ -204,6 +208,8 @@ class ThermometryModel(QObject):
 
     def calculate_temperature(self, original_temperature, apply_gaussian_filter=False, apply_b0_correction=False, use_registration=False, sigma=1.0):
         """Calculate temperature changes using PRF thermometry with improved filtering."""
+        # A failed attempt must not leave the previous frame's low-signal mask.
+        self.valid_temperature_mask = None
         if self.real1 is None or self.imag1 is None or self.real2 is None or self.imag2 is None:
             self.error_occurred.emit("Missing required DICOM data")
             return False
@@ -268,7 +274,12 @@ class ThermometryModel(QObject):
             
             # Calculate absolute temperature from temperature change (add baseline)
             self.temperature_map = original_temperature + self.temperature_change
-            
+            # Same 10% magnitude mask as above.  The temperature values are
+            # left as they were; CEM43 uses this mask to skip low signal.
+            self.valid_temperature_mask = (
+                valid_signal_mask & np.isfinite(self.temperature_map)
+            )
+
             # Emit signal to notify view
             self.temperature_updated.emit(self.temperature_map)
             
@@ -366,6 +377,7 @@ class ThermometryModel(QObject):
         self.dem_b0_map = None
         self.temperature_change = None
         self.temperature_map = None
+        self.valid_temperature_mask = None
         self.phase1 = None
         self.phase2 = None
         self.phase_diff = None

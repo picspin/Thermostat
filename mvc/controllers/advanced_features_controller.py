@@ -3,9 +3,14 @@
 import os
 import threading
 import numpy as np
-from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QSlider, QLabel, QFileDialog, QProgressBar
+from PyQt5.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QSlider, QLabel,
+    QFileDialog, QProgressBar, QMessageBox, QWidget,
+)
 from PyQt5.QtCore import Qt, QTimer
 from mvc.controllers.background_work import BackgroundCall
+from mvc.models.thermal_dose import ThermalDoseError, calculate_cinema_cem43
+from mvc.views.thermal_dose_dialog import create_thermal_dose_dialog, roi_mask_from_points
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
@@ -182,6 +187,10 @@ class AdvancedFeaturesController:
         if not temperature_sequence or all(t is None for t in temperature_sequence):
             self.view.show_error("Failed to generate temperature maps for the sequence.")
             return
+
+        # CEM43 uses the finished sequence.  A missing AcquisitionTime is
+        # reported and does not block the temperature cinema that follows.
+        self._show_thermal_dose(temperature_sequence)
         
         # Create dialog for cinema display
         cinema_dialog = QDialog(self.view)
@@ -345,6 +354,112 @@ class AdvancedFeaturesController:
         
         # Show the dialog
         cinema_dialog.exec_()
+
+    def _show_thermal_dose(self, temperature_sequence):
+        """Show the CEM43 map, ROI temperature, and cumulative dose.
+
+        The calculation is the independent thermal-dose module.  Failure
+        stops that display and says why; it does not invent equal spacing
+        and it does not change the temperature sequence.
+        """
+        masks = getattr(self.cinema_model, "validity_sequence", None)
+        if masks is not None and len(masks) != len(temperature_sequence):
+            self._report_dose_failure(
+                "The low-signal masks do not match the temperature sequence. "
+                "CEM43 was not calculated, and equal spacing was not assumed."
+            )
+            return
+        # Cinema clears its own lists when the player closes.  Keep the maps
+        # and masks here so "Update ROI curves" still works afterwards.
+        held_maps = list(temperature_sequence)
+        held_masks = None if masks is None else list(masks)
+
+        def calculate():
+            return calculate_cinema_cem43(
+                real_sources=getattr(self.view, "all_real_files", None),
+                imag_sources=getattr(self.view, "all_imag_files", None),
+                temperature_maps=held_maps,
+                valid_masks=held_masks,
+                roi_mask=self._roi_mask_for_sequence(held_maps),
+            )
+
+        try:
+            result = calculate()
+        except ThermalDoseError as exc:
+            self._report_dose_failure(str(exc))
+            return
+        except Exception as exc:
+            self._report_dose_failure(f"CEM43 was not calculated: {exc}")
+            return
+        self.view.update_status(
+            f"CEM43 calculated from AcquisitionTime. {self._dose_status(result)}",
+            timeout_ms=0,
+        )
+        try:
+            previous = getattr(self, "_thermal_dose_dialog", None)
+            if previous is not None:
+                previous.close()
+            dialog = create_thermal_dose_dialog(
+                self.view,
+                result,
+                recalculate=calculate,
+            )
+            # Modeless, so an ROI can be drawn on the main view and the
+            # curves refreshed.  The cinema player still opens on top.
+            dialog.setWindowModality(Qt.NonModal)
+            self._thermal_dose_dialog = dialog
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+        except Exception as exc:
+            self._report_dose_failure(f"CEM43 was not displayed: {exc}")
+
+    def _roi_mask_for_sequence(self, temperature_sequence):
+        shape = None
+        for temperature in temperature_sequence:
+            if temperature is not None:
+                shape = np.shape(temperature)
+                break
+        if shape is None or len(shape) != 2:
+            return None
+        manager = getattr(self.view, "roi_manager", None)
+        if manager is None:
+            return None
+        mask = getattr(manager, "mask", None)
+        if mask is not None and np.shape(mask) == shape:
+            mask = np.asarray(mask, dtype=bool)
+            # An empty raster is "no ROI", not a failed dose.  The map can
+            # still be shown, and the curves stay absent.
+            if not np.any(mask):
+                return None
+            return mask
+        points = getattr(manager, "roi_points", None) or []
+        if len(points) < 3:
+            return None
+        raster = roi_mask_from_points(points, shape)
+        if raster is None or not np.any(raster):
+            return None
+        return raster
+
+    def _report_dose_failure(self, message):
+        """Report a dose failure without inventing a CEM43 map.
+
+        A real window gets a modal warning so the cinema player cannot cover
+        it.  Tests that use a plain fake view only record the message.
+        """
+        self.view.update_status(message, timeout_ms=0)
+        if isinstance(self.view, QWidget):
+            QMessageBox.warning(self.view, "CEM43 thermal dose", message)
+            return
+        show_error = getattr(self.view, "show_error", None)
+        if show_error is not None:
+            show_error(message)
+
+    @staticmethod
+    def _dose_status(result):
+        if np.isfinite(result.map_max_cem43):
+            return f"Map maximum {result.map_max_cem43:.3f} CEM43."
+        return "No valid voxels were accumulated."
     
     def generate_thermostat(self):
         """Generate time-temperature curve for the selected ROI."""
