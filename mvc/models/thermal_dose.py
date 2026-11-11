@@ -10,8 +10,14 @@ A missing Acquisition Time stops the calculation.
 
 Low-signal voxels are excluded only when the caller passes a validity mask
 (the thermometry model records the same 10% magnitude mask it already uses
-for PRF).  Non-finite temperatures are always excluded.  Excluded voxels do
-not add dose for that frame; they are not replaced with a default temperature.
+for PRF).  A missing mask does not mean those voxels are low-SNR; only
+non-finite temperatures are then excluded.  Excluded voxels do not add dose
+for that frame and are not replaced with a default temperature.  A missing
+frame (``None``) adds nothing for its interval; the other frames are kept.
+
+Cinema maps are used as stored.  With motion correction off, each map is the
+baseline plus the change between that pair of frames, not temperature versus
+the first phase.  This module does not rewrite those maps.
 """
 
 from __future__ import annotations
@@ -156,7 +162,14 @@ def accumulate_thermal_dose(
             valid = _valid_voxels(observed, masks[index])
             increment = np.zeros(shape, dtype=float)
             if np.any(valid):
+                # Overflow is not a real dose.  Drop those voxels for this
+                # frame instead of storing a zero contribution as valid.
                 rate = _rate(observed[valid])
+                usable = np.isfinite(rate)
+                if not np.all(usable):
+                    rejected = np.flatnonzero(valid.ravel())[~usable]
+                    valid.ravel()[rejected] = False
+                    rate = rate[usable]
                 increment[valid] = delta_t[index] * rate
             running = running + increment
             ever_valid |= valid
@@ -342,7 +355,8 @@ def parse_acquisition_time(value) -> Optional[float]:
             whole = text
             if "." in text:
                 whole, frac = text.split(".", 1)
-                if frac == "" or not frac.isdigit():
+                # DICOM puts the fraction on HHMMSS only.  "10.5" is not a TM.
+                if len(whole) != 6 or frac == "" or not frac.isdigit():
                     raise ValueError(text)
                 fraction = float("0." + frac)
             if not whole.isdigit() or len(whole) not in (2, 4, 6):
@@ -409,15 +423,13 @@ def format_dose_summary(result: ThermalDoseResult) -> str:
 
 
 def _rate(temperature: np.ndarray) -> np.ndarray:
-    """R^(43−T) for finite temperatures.  The caller has already masked them."""
+    """R^(43−T).  Non-finite results stay NaN so the caller can reject them."""
 
     temp = np.asarray(temperature, dtype=float)
     ratio = r_factor(temp)
-    # A pathological temperature can overflow.  Those voxels are invalid.
     with np.errstate(over="ignore", invalid="ignore"):
         rate = np.power(ratio, BREAKPOINT_CELSIUS - temp)
-    rate = np.where(np.isfinite(rate), rate, 0.0)
-    return rate
+    return np.asarray(rate, dtype=float)
 
 
 def _valid_voxels(temperature: np.ndarray, mask) -> np.ndarray:

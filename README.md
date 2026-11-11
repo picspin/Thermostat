@@ -102,7 +102,7 @@ python -m pytest
 
 勾选运动校正时，默认改为刚体对齐后再做约 40 mm 网格的 B-spline，相似度是半径 4 体素的局部相关，mask 是 Otsu 组织区再膨胀 12 mm。这会改变勾选后的温度图。`RegistrationConfig()` 仍是原来的单阶段 B-spline 和 Mattes MI，需要旧结果时显式传入。没有肝脏分割模型；Otsu 不能把胸腹壁从肝脏里分开。校正结果额外记录 NCC、MAE、位移和折叠比例，但这些数值不改变是否接受这次校正。界面上的运动校正在后台线程运行，取消会丢弃尚未应用的结果，不改变已经完成的配准。Cinema 只有在勾选运动校正时才配准，并且每一帧都以第一帧为参考；序列也在后台计算，取消只停止下一帧，已经算出的帧保留。另有一个必须显式启用的单病例 INR 容积校正，以及独立的低秩加稀疏分析；说明见 [docs/inr_volume_correction.md](docs/inr_volume_correction.md)。
 
-Cinema 序列完成后会另外计算 CEM43。计算在 `mvc/models/thermal_dose.py`，不调用配准，也不读取 `RegistrationConfig`。Δt 只来自 DICOM Acquisition Time (0008,0032)；没有这个标签就停止，不会改用 SeriesTime，也不会换成等间隔。低信号体素沿用温度计算里已有的 10% 幅值掩膜，温度图本身不改。39°C、CEM43 = 2 和 CEM43 = 9 默认不画，勾选后也只标注为 van Rhoon 等，Eur Radiol 2013 的 MR 射频安全参考，不能当成治疗完成。
+Cinema 序列完成后会另外计算 CEM43。计算在 `mvc/models/thermal_dose.py`，不调用配准，也不读取 `RegistrationConfig`。它直接使用已经算出的温度图：未勾选运动校正时，每一帧仍是相邻两帧的温差再加基线，不是相对第一帧的温度。Δt 只来自 DICOM Acquisition Time (0008,0032)；没有这个标签就停止，不会改用 SeriesTime，也不会换成等间隔。低信号体素沿用温度计算里已有的 10% 幅值掩膜，温度图本身不改。39°C、CEM43 = 2 和 CEM43 = 9 默认不画，勾选后也只标注为 van Rhoon 等，Eur Radiol 2013 的 MR 射频安全参考，不能当成治疗完成。
 
 推送和拉取请求会运行 `.github/workflows/tests.yml`：安装依赖、`compileall` 和 `pytest`。它不启动图形界面。
 

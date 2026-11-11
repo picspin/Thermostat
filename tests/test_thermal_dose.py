@@ -218,6 +218,23 @@ def test_backwards_clock_is_not_turned_into_a_midnight_dose():
     assert parse_acquisition_time(None) is None
 
 
+def test_fractional_acquisition_time_requires_hhmmss():
+    assert parse_acquisition_time("101010.5") == pytest.approx(10 * 3600 + 10 * 60 + 10.5)
+    with pytest.raises(ThermalDoseError, match="not a DICOM TM"):
+        parse_acquisition_time("10.5")
+    with pytest.raises(ThermalDoseError, match="not a DICOM TM"):
+        parse_acquisition_time("1010.5")
+
+
+def test_overflowing_temperature_is_not_stored_as_zero_dose():
+    temperature = np.array([[43.0, 1.0e6]])
+
+    dose = accumulate_cem43([temperature], [1.0])
+
+    np.testing.assert_allclose(dose[0, 0], 1.0)
+    assert np.isnan(dose[0, 1])
+
+
 def test_non_positive_acquisition_interval_fails():
     with pytest.raises(ThermalDoseError, match="not positive"):
         intervals_minutes([AcquisitionClock(100.0), AcquisitionClock(100.0)])
