@@ -528,6 +528,34 @@ def test_mind_defaults_are_opt_in_and_do_not_change_the_other_metrics():
     assert "MIND" not in plain.stop_condition
     np.testing.assert_allclose(plain.warped_real, retuned.warped_real, atol=1e-6)
 
+    from dataclasses import replace
+
+    checkbox_config = replace(
+        checkbox,
+        random_seed=1234,
+        iterations=4,
+        shrink_factors=(1,),
+        smoothing_sigmas=(0.0,),
+    )
+    checkbox_plain = SimpleITKRegistrar().register_complex(
+        fixed, None, moving, None, checkbox_config
+    )
+    checkbox_retuned = SimpleITKRegistrar().register_complex(
+        fixed,
+        None,
+        moving,
+        None,
+        replace(checkbox_config, mind_radius=3, mind_sample_stride=5),
+    )
+
+    assert checkbox_plain.succeeded
+    assert checkbox_retuned.succeeded
+    assert checkbox_plain.metric_name == "ANTSNeighborhoodCorrelation"
+    assert checkbox_retuned.metric_name == "ANTSNeighborhoodCorrelation"
+    np.testing.assert_allclose(
+        checkbox_plain.warped_real, checkbox_retuned.warped_real, atol=1e-6
+    )
+
 
 def _resample_with_spacing(image, spacing, translation):
     source = sitk.GetImageFromArray(np.asarray(image, dtype=np.float64))
