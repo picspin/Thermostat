@@ -3,9 +3,18 @@
 import os
 import threading
 import numpy as np
-from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QSlider, QLabel, QFileDialog, QProgressBar
+from PyQt5.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QSlider, QLabel,
+    QFileDialog, QProgressBar, QMessageBox, QWidget,
+)
 from PyQt5.QtCore import Qt, QTimer
 from mvc.controllers.background_work import BackgroundCall
+from mvc.models.thermal_dose import (
+    CONSECUTIVE_PAIR_DOSE_MESSAGE,
+    ThermalDoseError,
+    calculate_cinema_cem43,
+)
+from mvc.views.thermal_dose_dialog import create_thermal_dose_dialog, roi_mask_from_points
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
@@ -182,6 +191,17 @@ class AdvancedFeaturesController:
         if not temperature_sequence or all(t is None for t in temperature_sequence):
             self.view.show_error("Failed to generate temperature maps for the sequence.")
             return
+
+        # This run now owns the stored sequence.  A dose warning below is
+        # modal, and the user can close the previous player while it is up.
+        # That close must not clear the sequence this run just calculated.
+        # An all-missing sequence returned above and did not take ownership.
+        self._cinema_generation = getattr(self, "_cinema_generation", 0) + 1
+        generation = self._cinema_generation
+
+        # CEM43 uses the finished sequence.  A missing AcquisitionTime is
+        # reported and does not block the temperature cinema that follows.
+        self._show_thermal_dose(temperature_sequence)
         
         # Create dialog for cinema display
         cinema_dialog = QDialog(self.view)
@@ -336,15 +356,152 @@ class AdvancedFeaturesController:
         stop_button.clicked.connect(stop_animation)
         save_button.clicked.connect(save_video)
         
-        # Memory management - clear sequence data when dialog is closed
+        # Memory management - clear sequence data when dialog is closed.
+        # Only the player from the latest run may clear.  An older modeless
+        # player can close after a new sequence has already been stored.
         def on_cinema_dialog_close():
-            # Clear sequence data to free memory when not needed
+            stop_animation()
+            plt.close(fig)
+            if getattr(self, "_cinema_generation", None) != generation:
+                return
             self.cinema_model.clear_sequence()
+            if getattr(self, "_cinema_dialog", None) is cinema_dialog:
+                self._cinema_dialog = None
             
         cinema_dialog.finished.connect(on_cinema_dialog_close)
-        
-        # Show the dialog
-        cinema_dialog.exec_()
+
+        # show(), not exec_().  exec_() is application-modal, so it would
+        # block the CEM43 dialog and the main view.  The dose window is
+        # modeless on purpose: an ROI can be drawn and its curves refreshed
+        # while the player is open.  Keep a Python reference; show() returns.
+        previous_player = getattr(self, "_cinema_dialog", None)
+        self._cinema_dialog = cinema_dialog
+        cinema_dialog.setWindowModality(Qt.NonModal)
+        if previous_player is not None and previous_player is not cinema_dialog:
+            previous_player.close()
+        cinema_dialog.show()
+        cinema_dialog.raise_()
+        cinema_dialog.activateWindow()
+
+    def _show_thermal_dose(self, temperature_sequence):
+        """Show the CEM43 map, ROI temperature, and cumulative dose.
+
+        The calculation is the independent thermal-dose module.  Failure
+        stops that display and says why; it does not invent equal spacing
+        and it does not change the temperature sequence.
+        """
+        # Drop a dose window from an earlier sequence before deciding.  A
+        # refusal must not leave the previous numbers on screen.
+        self._close_thermal_dose_dialog()
+        # Consecutive-pair maps are baseline plus the adjacent change.
+        # CEM43(T) is exponential in T, so displaying that number is not a
+        # small bias.  Refuse it instead of warning next to a wrong dose.
+        if not getattr(self.cinema_model, "motion_correction_applied", False):
+            self._report_dose_failure(CONSECUTIVE_PAIR_DOSE_MESSAGE)
+            return
+        masks = getattr(self.cinema_model, "validity_sequence", None)
+        if masks is not None and len(masks) != len(temperature_sequence):
+            self._report_dose_failure(
+                "The low-signal masks do not match the temperature sequence. "
+                "CEM43 was not calculated, and equal spacing was not assumed."
+            )
+            return
+        # Cinema clears its own lists when the player closes.  Keep the maps
+        # and masks here so "Update ROI curves" still works afterwards.
+        held_maps = list(temperature_sequence)
+        held_masks = None if masks is None else list(masks)
+
+        def calculate():
+            return calculate_cinema_cem43(
+                real_sources=getattr(self.view, "all_real_files", None),
+                imag_sources=getattr(self.view, "all_imag_files", None),
+                temperature_maps=held_maps,
+                valid_masks=held_masks,
+                roi_mask=self._roi_mask_for_sequence(held_maps),
+            )
+
+        try:
+            result = calculate()
+        except ThermalDoseError as exc:
+            self._report_dose_failure(str(exc))
+            return
+        except Exception as exc:
+            self._report_dose_failure(f"CEM43 was not calculated: {exc}")
+            return
+        self.view.update_status(
+            f"CEM43 calculated from AcquisitionTime. {self._dose_status(result)}",
+            timeout_ms=0,
+        )
+        try:
+            dialog = create_thermal_dose_dialog(
+                self.view,
+                result,
+                recalculate=calculate,
+            )
+            # Modeless, and the cinema player is modeless too.  An ROI can
+            # be drawn on the main view and these curves refreshed while
+            # the player is open.  The maps here are copies, so closing the
+            # player (which clears the cinema sequence) does not blank them.
+            dialog.setWindowModality(Qt.NonModal)
+            self._thermal_dose_dialog = dialog
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+        except Exception as exc:
+            self._report_dose_failure(f"CEM43 was not displayed: {exc}")
+
+    def _roi_mask_for_sequence(self, temperature_sequence):
+        shape = None
+        for temperature in temperature_sequence:
+            if temperature is not None:
+                shape = np.shape(temperature)
+                break
+        if shape is None or len(shape) != 2:
+            return None
+        manager = getattr(self.view, "roi_manager", None)
+        if manager is None:
+            return None
+        mask = getattr(manager, "mask", None)
+        if mask is not None and np.shape(mask) == shape:
+            mask = np.asarray(mask, dtype=bool)
+            # An empty raster is "no ROI", not a failed dose.  The map can
+            # still be shown, and the curves stay absent.
+            if not np.any(mask):
+                return None
+            return mask
+        points = getattr(manager, "roi_points", None) or []
+        if len(points) < 3:
+            return None
+        raster = roi_mask_from_points(points, shape)
+        if raster is None or not np.any(raster):
+            return None
+        return raster
+
+    def _close_thermal_dose_dialog(self):
+        previous = getattr(self, "_thermal_dose_dialog", None)
+        if previous is not None:
+            previous.close()
+            self._thermal_dose_dialog = None
+
+    def _report_dose_failure(self, message):
+        """Report a dose failure without inventing a CEM43 map.
+
+        A real window gets a modal warning so the cinema player cannot cover
+        it.  Tests that use a plain fake view only record the message.
+        """
+        self.view.update_status(message, timeout_ms=0)
+        if isinstance(self.view, QWidget):
+            QMessageBox.warning(self.view, "CEM43 thermal dose", message)
+            return
+        show_error = getattr(self.view, "show_error", None)
+        if show_error is not None:
+            show_error(message)
+
+    @staticmethod
+    def _dose_status(result):
+        if np.isfinite(result.map_max_cem43):
+            return f"Map maximum {result.map_max_cem43:.3f} CEM43."
+        return "No valid voxels were accumulated."
     
     def generate_thermostat(self):
         """Generate time-temperature curve for the selected ROI."""
