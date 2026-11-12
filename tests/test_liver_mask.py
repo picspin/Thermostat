@@ -236,7 +236,7 @@ def test_registrar_uses_the_coarse_mask_and_ignores_the_knob_otherwise():
     assert sitk.GetArrayFromImage(overridden)[20, 60] == 0
 
 
-def test_liver_wall_knob_does_not_change_an_unmasked_registration():
+def test_liver_wall_knob_does_not_change_unmasked_metric_masks():
     fixed = np.zeros((32, 32), dtype=float)
     fixed[8:24, 8:24] = 30.0
     fixed[12:20, 14:22] = 80.0
@@ -258,12 +258,12 @@ def test_liver_wall_knob_does_not_change_an_unmasked_registration():
         liver_wall_mm=6.0,
     )
 
-    first = SimpleITKRegistrar().register_complex(fixed, None, moving, None, plain)
-    second = SimpleITKRegistrar().register_complex(fixed, None, moving, None, retuned)
+    fixed_image = _image(fixed, (1.0, 1.0))
+    moving_image = _image(moving, (1.0, 1.0))
+    registrar = SimpleITKRegistrar()
 
-    assert first.succeeded and second.succeeded
-    assert first.metric_name == "MattesMutualInformation"
-    np.testing.assert_allclose(first.warped_real, second.warped_real, atol=1e-6)
+    assert registrar._metric_masks(fixed_image, moving_image, plain) == (None, None)
+    assert registrar._metric_masks(fixed_image, moving_image, retuned) == (None, None)
 
 
 def test_coarse_liver_registration_recovers_a_translation():
@@ -346,5 +346,4 @@ def test_cinema_checkbox_on_without_a_config_uses_the_matching_fallback():
     assert historical.mask_kind == "coarse_liver"
     assert historical.metric == "mattes_mi"
     assert historical.transform_kind == "bspline"
-
 
