@@ -307,10 +307,11 @@ class INRVolumeRegistrar:
     outbound path, which is the hysteresis.  ``s`` is ``displacement_scale``
     in voxels.  The reference phase holds both vectors at zero.
 
-    ``J c`` is a sum of analytic gradient fields, so it represents smooth
-    divergence-free-looking local motion rather than a large rotation.  The
-    explicit ``a_t`` is required because a small-weight ``tanh`` network has
-    a near-zero mean Jacobian and cannot move the whole volume by itself.
+    ``J c`` is a sum of analytic gradient fields, so it is curl-free: it can
+    represent a smooth expansion or a respiratory-like bend, but not a large
+    rotation or a shear.  The explicit ``a_t`` is required because a
+    small-weight ``tanh`` network has a near-zero mean Jacobian and cannot
+    move the whole volume by itself.
     """
 
     def __init__(self, config: INRRegistrationConfig | None = None) -> None:
@@ -510,9 +511,9 @@ def _optimize(
         projection_history.append(float(terms["projection"]))
         mind_history.append(float(terms["mind"]))
 
-        # Gradients are means over the sampled coordinates, so the step does
-        # not grow with the sample count.  The schedule only damps later
-        # iterations.
+        # The schedule only damps later iterations.  One learning rate serves
+        # every parameter group because the update divides by that group's
+        # own RMS; see ``_update_vector``.
         step = config.learning_rate / (1.0 + np.sqrt(iteration))
         _update_vector(
             coefficients,
@@ -597,23 +598,22 @@ def _objective_and_gradients(
         displacement = config.displacement_scale * activated
         d_disp_d_field = config.displacement_scale * (1.0 - np.square(activated))
         phase_data = prepared[phase]
-        moved = _warp_samples(phase_data["image"], coords, displacement)
+        position = _sample_positions(coords, phase_data["image"].shape, displacement)
+        moved, image_slope = _sample_scalar(phase_data["image"], position)
         projection, d_intensity = _projection_loss_and_intensity_grad(
             moved,
             reference["samples"],
+            coords,
             phase_data["image"].shape,
         )
-        image_gradient = _sample_gradient(phase_data["image"], coords, displacement)
-        moved_mind = _sample_channels(phase_data["mind"], coords, displacement)
+        moved_mind, mind_slope = _sample_linear(phase_data["mind"], position)
         mind, d_mind = _mind_loss_and_grad(moved_mind, reference["mind_samples"])
-        # The descriptor's spatial derivative is precomputed.  Only the values
-        # at the displaced samples are needed, which is much cheaper than
-        # rebuilding the descriptor at a perturbed displacement.
-        mind_gradient = _sample_mind_gradient(
-            phase_data["mind_grad"], coords, displacement, d_mind
-        )
+        # Slope of the same linear interpolant that produced ``moved_mind``.
+        # A precomputed central-difference volume is a different operator and
+        # stores a full descriptor gradient that a 3D phase does not need.
+        mind_gradient = np.einsum("nc,ncd->nd", d_mind, mind_slope)
         d_displacement = (
-            config.projection_weight * d_intensity[:, None] * image_gradient
+            config.projection_weight * d_intensity[:, None] * image_slope
             + config.mind_weight * mind_gradient
         )
         d_field = d_displacement * d_disp_d_field
@@ -628,10 +628,14 @@ def _objective_and_gradients(
 
     if comparisons == 0:
         raise ValueError("volume must contain a phase other than the reference")
-    samples = max(coords.shape[0], 1)
-    jacobian_upstream /= comparisons * samples
-    coefficient_grad /= comparisons * samples
-    translation_grad /= comparisons * samples
+    # ``d_intensity`` and ``d_mind`` are already derivatives of means, and the
+    # sums above fold in every sample.  Dividing by the sample count a second
+    # time shrinks the data term by that factor relative to weight decay and
+    # the temporal penalty, so a 64-wide layer only feels the decay.  Average
+    # across phases only.
+    jacobian_upstream /= comparisons
+    coefficient_grad /= comparisons
+    translation_grad /= comparisons
     weight_grads, bias_grads = mlp.jacobian_parameter_gradients(coords, jacobian_upstream)
     temporal_grad = _temporal_gradient(coefficients, translations, reference_index)
     coefficient_grad += config.temporal_smooth_weight * temporal_grad[0]
@@ -658,12 +662,12 @@ def _prepare_phase_terms(volume: np.ndarray, coords: np.ndarray, config) -> dict
         descriptor = mind_descriptor(
             image, radius=config.mind_radius, sigma=config.mind_sigma
         )
+        position = _sample_positions(coords, image.shape, zero)
         prepared[phase] = {
             "image": image,
             "mind": descriptor,
-            "mind_grad": _descriptor_gradient(descriptor),
-            "samples": _warp_samples(image, coords, zero),
-            "mind_samples": _sample_channels(descriptor, coords, zero),
+            "samples": _sample_scalar(image, position)[0],
+            "mind_samples": _sample_linear(descriptor, position)[0],
         }
     return prepared
 
@@ -675,22 +679,22 @@ def _update_vector(target, gradient, velocity, step, momentum, clip):
         )
     if not np.all(np.isfinite(gradient)):
         raise FloatingPointError("INR gradient became non-finite")
-    # Each parameter group has its own scale: a translation mean, a weight
-    # matrix and a bias do not share units.  Dividing by the RMS makes one
-    # learning rate meaningful for all of them.  The clip only rejects a
-    # non-finite blow-up; a normal RMS-normalized gradient has length 1.
+    # Each parameter group has its own scale: a translation, a 64×64 weight
+    # and a bias do not share units.  Dividing by the RMS makes one learning
+    # rate meaningful for all of them.  ``clip`` bounds that RMS.  It must
+    # not bound the L2 norm: after this division a 64×64 matrix has L2 64,
+    # and capping that at 5 multiplies the step by 5/64, which freezes the
+    # spatial basis.  A finite RMS-normalized direction already has RMS 1, so
+    # the default clip of 5 does not shrink it.  Non-finite gradients are
+    # rejected above.
     scale = float(np.sqrt(np.mean(np.square(gradient)))) + 1e-8
-    direction = _clip(gradient / scale, clip)
+    direction = gradient / scale
+    direction_rms = float(np.sqrt(np.mean(np.square(direction))))
+    if direction_rms > clip > 0.0:
+        direction *= clip / direction_rms
     velocity *= momentum
     velocity += (1.0 - momentum) * direction
     target -= step * velocity
-
-
-def _clip(gradient: np.ndarray, clip: float) -> np.ndarray:
-    norm = float(np.linalg.norm(gradient))
-    if norm > clip > 0.0:
-        return gradient * (clip / norm)
-    return gradient
 
 
 def _dense_displacement(
@@ -893,94 +897,170 @@ def _warp_samples(image: np.ndarray, coords: np.ndarray, offset: np.ndarray) -> 
     return sampled
 
 
-def _sample_channels(descriptor: np.ndarray, coords: np.ndarray, offset: np.ndarray):
-    sampled = [
-        _warp_samples(descriptor[..., channel], coords, offset)
-        for channel in range(descriptor.shape[-1])
-    ]
-    return np.stack(sampled, axis=1)
+def _sample_positions(coords: np.ndarray, spatial_shape, offset: np.ndarray) -> np.ndarray:
+    return _normalized_to_index(coords, spatial_shape) + offset
 
 
-def _sample_gradient(image: np.ndarray, coords: np.ndarray, offset: np.ndarray) -> np.ndarray:
-    """Central difference ``dI/du`` in voxel units.
+def _sample_scalar(image: np.ndarray, position: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    values, slope = _sample_linear(image, position)
+    return values[:, 0], slope[:, 0, :]
 
-    The probe is one voxel either side, so the divisor is two.  Using a half
-    voxel without that divisor both doubles the gradient and, combined with
-    the displacement sign below, walks the phase away from the reference.
+
+def _sample_linear(volume: np.ndarray, index: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Values and slope of multilinear interpolation with nearest outside.
+
+    ``volume`` is a scalar image ``(*spatial,)`` or ``(*spatial, channels)``.
+    ``index`` is ``(N, D)`` in NumPy axis order.  Returns ``values`` of shape
+    ``(N, C)`` and ``slope`` of shape ``(N, C, D)`` with
+    ``slope = d(value)/d(index)``.  This is the derivative of
+    ``map_coordinates(..., order=1, mode="nearest", prefilter=False)``, not a
+    central difference of a precomputed volume.
+
+    Inside a cell the slope along one axis is that cell's forward difference
+    and the other axes stay linear.  Exactly on a voxel the two adjacent
+    cells disagree; their average is what a central difference sees, and a
+    zero-displacement start lands on integer voxels, so that average is what
+    lets the first step move.  An axis outside the image, and any singleton
+    axis, contributes slope zero because nearest lookup is flat there.
     """
-    base = _normalized_to_index(coords, image.shape) + offset
-    gradients = []
-    for axis in range(image.ndim):
-        plus = np.array(base, copy=True)
-        minus = np.array(base, copy=True)
-        plus[:, axis] += 1.0
-        minus[:, axis] -= 1.0
-        right = map_coordinates(image, plus.T, order=1, mode="nearest", prefilter=False)
-        left = map_coordinates(image, minus.T, order=1, mode="nearest", prefilter=False)
-        gradients.append(0.5 * (right - left))
-    return np.stack(gradients, axis=1)
-
-
-def _sample_mind_gradient(mind_grad, coords, offset, upstream) -> np.ndarray:
-    """Sample ``d(descriptor)/d(voxel)`` and contract it with ``upstream``."""
-    channels = mind_grad.shape[-2]
-    spatial = []
-    for axis in range(offset.shape[1]):
-        sampled_channels = [
-            _warp_samples(mind_grad[..., channel, axis], coords, offset)
-            for channel in range(channels)
-        ]
-        spatial.append(np.stack(sampled_channels, axis=1))
-    sampled = np.stack(spatial, axis=-1)
-    if sampled.shape != upstream.shape + (offset.shape[1],):
+    coords = np.asarray(index, dtype=float)
+    array = np.asarray(volume, dtype=float)
+    if coords.ndim != 2:
+        raise RuntimeError(f"sample index must have shape (N, D), got {coords.shape}")
+    dim = coords.shape[1]
+    if array.ndim == dim:
+        array = array[..., None]
+    elif array.ndim != dim + 1:
         raise RuntimeError(
-            f"sampled MIND gradient shape {sampled.shape} does not match "
-            f"upstream {upstream.shape}"
+            f"volume ndim {array.ndim} does not match sample dimension {dim}"
         )
-    return np.einsum("nc,ncd->nd", upstream, sampled)
+    spatial = array.shape[:-1]
+    count = coords.shape[0]
+    floors = np.floor(coords).astype(np.int64)
+    fracs = coords - floors
+    sizes = np.asarray(spatial, dtype=np.int64)
+    channels = array.shape[-1]
+
+    def gather(voxel_index: np.ndarray) -> np.ndarray:
+        clipped = np.clip(voxel_index, 0, sizes - 1)
+        return array[tuple(clipped.T)]
+
+    values = np.zeros((count, channels), dtype=float)
+    for mask in range(1 << dim):
+        weight = np.ones(count, dtype=float)
+        voxel = np.empty((count, dim), dtype=np.int64)
+        for axis in range(dim):
+            bit = (mask >> axis) & 1
+            fraction = fracs[:, axis]
+            weight *= fraction if bit else (1.0 - fraction)
+            voxel[:, axis] = floors[:, axis] + bit
+        values += weight[:, None] * gather(voxel)
+
+    slope = np.zeros((count, channels, dim), dtype=float)
+    for axis in range(dim):
+        others = [item for item in range(dim) if item != axis]
+        diff = np.zeros((count, channels), dtype=float)
+        for mask in range(1 << len(others)):
+            weight = np.ones(count, dtype=float)
+            index_lo = floors.copy()
+            index_hi = floors.copy()
+            index_hi[:, axis] = floors[:, axis] + 1
+            for bit_index, other in enumerate(others):
+                bit = (mask >> bit_index) & 1
+                fraction = fracs[:, other]
+                weight *= fraction if bit else (1.0 - fraction)
+                source = floors[:, other] + bit
+                index_lo[:, other] = source
+                index_hi[:, other] = source
+            diff += weight[:, None] * (gather(index_hi) - gather(index_lo))
+        on_grid = np.isclose(fracs[:, axis], 0.0)
+        if np.any(on_grid):
+            left = np.zeros_like(diff)
+            for mask in range(1 << len(others)):
+                weight = np.ones(count, dtype=float)
+                index_lo = floors.copy()
+                index_hi = floors.copy()
+                index_lo[:, axis] = floors[:, axis] - 1
+                for bit_index, other in enumerate(others):
+                    bit = (mask >> bit_index) & 1
+                    fraction = fracs[:, other]
+                    weight *= fraction if bit else (1.0 - fraction)
+                    source = floors[:, other] + bit
+                    index_lo[:, other] = source
+                    index_hi[:, other] = source
+                left += weight[:, None] * (gather(index_hi) - gather(index_lo))
+            diff = np.where(on_grid[:, None], 0.5 * (diff + left), diff)
+        # Nearest lookup is constant outside the image, so that side of an
+        # out-of-range sample does not contribute.  ``gather`` already clips.
+        slope[:, :, axis] = diff
+    if not np.all(np.isfinite(values)) or not np.all(np.isfinite(slope)):
+        raise FloatingPointError("resampling produced a non-finite value")
+    return values, slope
 
 
-def _descriptor_gradient(descriptor: np.ndarray) -> np.ndarray:
-    """Central ``d(descriptor)/d(voxel)`` with shape ``spatial + (channels, dim)``."""
-    spatial_dim = descriptor.ndim - 1
-    channels = descriptor.shape[-1]
-    gradient = np.empty(descriptor.shape + (spatial_dim,), dtype=float)
-    for axis in range(spatial_dim):
-        for channel in range(channels):
-            slc = descriptor[..., channel]
-            plus = np.roll(slc, -1, axis=axis)
-            minus = np.roll(slc, 1, axis=axis)
-            gradient[..., channel, axis] = 0.5 * (plus - minus)
-    return gradient
+def _projection_loss_and_intensity_grad(samples, reference_samples, coords, spatial_shape):
+    """Orthogonal localizer profiles and ``d(loss)/d(sample intensity)``.
 
+    A localizer is the mean intensity along one axis, indexed by the other
+    axes.  Samples that share those coordinates form one ray.  Comparing the
+    ray means is sensitive to a translation: a shift perpendicular to the ray
+    moves tissue into a different bin, and the orthogonal localizer sees a
+    shift parallel to this ray.  The scalar sum of a projection would not.
 
-def _projection_loss_and_intensity_grad(samples, reference_samples, spatial_shape):
-    """Sampled localizer consistency and its derivative w.r.t. intensity.
-
-    A localizer is the sum of the volume along every axis but one.  On the
-    subsampled coordinates that sum is the sum of the samples sharing a
-    localizer bin.  Comparing those raw sums is blind to a pure translation,
-    because the translated samples fall into the same bins and a normalized
-    profile does not say where along the ray the tissue moved.
-
-    The consistency term therefore compares each displaced moving sample with
-    the reference sample in the same normalized coordinate, divided by the
-    number of voxels that a full localizer ray would have summed.  Identity
-    displacement still has loss zero.  Summing one such term per axis keeps
-    the objective in localizer units rather than turning it into a voxel-wise
-    intensity match: a ray disagreement is counted once per localizer, and
-    the MIND term remains the cross-phase structural penalty.
+    Identity displacement has loss zero because both profiles use the same
+    bins.  A ray whose samples are brighter and darker by the same amount has
+    loss zero too.  That is the difference from a photometric residual, which
+    this objective does not use.  MIND remains the cross-phase structural term.
     """
-    del spatial_shape
-    if samples.shape != reference_samples.shape:
+    if samples.shape != reference_samples.shape or samples.ndim != 1:
         raise RuntimeError(
             f"localizer samples {samples.shape} != reference {reference_samples.shape}"
         )
-    ray_length = float(np.sqrt(max(samples.size, 1)))
-    difference = (samples - reference_samples) / ray_length
+    if coords.shape[0] != samples.shape[0] or coords.shape[1] != len(spatial_shape):
+        raise RuntimeError(
+            f"localizer coordinates {coords.shape} do not match samples {samples.shape}"
+        )
+    index = np.rint(_normalized_to_index(coords, spatial_shape)).astype(np.int64)
+    for axis, size in enumerate(spatial_shape):
+        index[:, axis] = np.clip(index[:, axis], 0, int(size) - 1)
+    dim = index.shape[1]
+    loss = 0.0
+    gradient = np.zeros(samples.shape[0], dtype=float)
+    for axis in range(dim):
+        others = [item for item in range(dim) if item != axis]
+        axis_loss, axis_gradient = _profile_loss(
+            samples, reference_samples, index, others, spatial_shape
+        )
+        loss += axis_loss
+        gradient += axis_gradient
+    return loss / dim, gradient / dim
+
+
+def _profile_loss(samples, reference, index, key_axes, spatial_shape):
+    if key_axes:
+        packed = np.zeros(samples.shape[0], dtype=np.int64)
+        stride = 1
+        for axis in reversed(key_axes):
+            packed += index[:, axis] * stride
+            stride *= int(spatial_shape[axis])
+    else:
+        packed = np.zeros(samples.shape[0], dtype=np.int64)
+    order = np.argsort(packed, kind="mergesort")
+    packed = packed[order]
+    ordered_samples = samples[order]
+    ordered_reference = reference[order]
+    change = np.flatnonzero(packed[1:] != packed[:-1]) + 1
+    starts = np.concatenate((np.zeros(1, dtype=int), change))
+    counts = np.diff(np.concatenate((starts, np.array([packed.shape[0]]))))
+    difference = (
+        np.add.reduceat(ordered_samples, starts) - np.add.reduceat(ordered_reference, starts)
+    ) / counts.astype(float)
     loss = float(np.mean(np.square(difference)))
-    intensity_grad = 2.0 * difference / (difference.size * ray_length)
-    return loss, intensity_grad
+    coeff = (2.0 / float(difference.size)) * difference / counts.astype(float)
+    ordered_gradient = np.repeat(coeff, counts)
+    gradient = np.empty(samples.shape[0], dtype=float)
+    gradient[order] = ordered_gradient
+    return loss, gradient
 
 
 def _mind_loss_and_grad(moved: np.ndarray, reference: np.ndarray):
@@ -1013,9 +1093,13 @@ def _one_temporal_gradient(values: np.ndarray, reference_index: int) -> np.ndarr
     if values.shape[0] < 3:
         return gradient
     delta = np.diff(values, axis=0)
+    # ``_temporal_smoothness`` contributes ``0.5 * mean(delta**2)`` for this
+    # array.  ``d(0.5 * mean(delta**2))/d(delta) = delta / delta.size``.
+    # Dividing only by ``T - 1`` leaves an extra factor of the column count,
+    # so rank 3 would be pulled three times too hard.
     gradient[:-1] -= delta
     gradient[1:] += delta
-    gradient /= max(values.shape[0] - 1, 1)
+    gradient /= float(delta.size)
     gradient[reference_index] = 0.0
     return gradient
 
