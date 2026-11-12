@@ -106,6 +106,8 @@ Cinema 序列完成后会另外计算 CEM43。计算在 `mvc/models/thermal_dose
 
 推送和拉取请求会运行 `.github/workflows/tests.yml`：安装依赖、`compileall` 和 `pytest`。它不启动图形界面。
 
+单病例 INR 容积校正使用定位像投影轮廓和 MIND；它必须显式启用，不进入运动校正勾选框或温度计算。
+
 ## 许可证
 
 本项目采用[MIT许可证](LICENSE)。
