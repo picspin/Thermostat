@@ -189,6 +189,38 @@ def test_registrar_exception_is_handled():
     assert model.registration_result is None
 
 
+class _CheckBox:
+    def __init__(self, checked):
+        self.checked = checked
+
+    def isChecked(self):
+        return self.checked
+
+
+def test_coarse_liver_checkbox_swaps_only_the_mask():
+    controller, _, view, registrar = _controller(_result())
+    stored = controller.registration_config
+    view.coarse_liver_checkbox = _CheckBox(True)
+
+    assert controller.apply_motion_correction() is True
+
+    passed = registrar.calls[0]["config"]
+    assert passed is not stored
+    assert passed.mask_kind == "coarse_liver"
+    assert passed.metric == stored.metric
+    assert passed.transform_kind == stored.transform_kind
+    assert stored.mask_kind == "none"
+
+
+def test_unchecked_coarse_liver_keeps_the_stored_config_object():
+    controller, _, view, registrar = _controller(_result())
+    view.coarse_liver_checkbox = _CheckBox(False)
+
+    assert controller.apply_motion_correction() is True
+
+    assert registrar.calls[0]["config"] is controller.registration_config
+
+
 def test_calculate_temperature_uses_registration_when_it_succeeds():
     controller, model, view, _ = _controller(_result())
 
