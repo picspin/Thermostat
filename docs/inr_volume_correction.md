@@ -102,7 +102,7 @@ INR 结果不会写回 `real2/imag2`。只有调用方把它放进 `model.regist
 
 PR #3 之后的验证没有改 SimpleITK 的默认参数，也没有改它的通过/警告规则。原因是下面三项还没有真实数据可以定案：
 
-1. `RegistrationConfig()` 仍是单阶段 B-spline 和 Mattes MI，梯度下降也不变。界面勾选框不再用它，而用 `liver_respiratory()`：先 rigid（不用 affine，避免无肝脏 mask 时剪切把肝脏拉斜），再接网格间距约 40 mm 的 B-spline。SimpleITK 没有弯曲能量度量，粗网格就是正则。相似度是半径 4 体素的 ANTS 邻域相关。Mask 是 Otsu 再膨胀 12 mm，只去掉空气并留一圈组织边缘，不是肝脏分割，亮的胸腹壁仍会留在 mask 里。`transform_kind="rigid"` 或 `"affine"` 仍可单用。
+1. `RegistrationConfig()` 仍是单阶段 B-spline 和 Mattes MI，梯度下降也不变。界面勾选框不再用它，而用 `liver_respiratory()`：先 rigid（不用 affine，避免无肝脏 mask 时剪切把肝脏拉斜），再接网格间距约 40 mm 的 B-spline。SimpleITK 没有弯曲能量度量，粗网格就是正则。相似度是半径 4 体素的 ANTS 邻域相关。Mask 是 Otsu 再膨胀 12 mm，只去掉空气并留一圈组织边缘，不是肝脏分割，亮的胸腹壁仍会留在 mask 里。另有一个默认关闭的粗肝脏 ROI（`mask_kind="coarse_liver"`，或界面勾选 “Use coarse liver ROI”）。它不改变这条默认 mask，INR 也不使用它。`transform_kind="rigid"` 或 `"affine"` 仍可单用。
 2. 相似度仍默认是 Mattes MI、10% 随机采样、不设种子。换成 correlation 或全采样会改变默认温度图，不能只凭一个合成 phantom 替换。
 3. 单病例路径：配准失败后仍按未校正数据继续算温度，并给出错误提示。改成失败即中止是产品行为，不是这次能自行切换的。Cinema 序列不适用这条：某一帧加载失败或配准失败时，该帧记为 `None`，不把上一帧的结果算进来，其余帧继续。
 

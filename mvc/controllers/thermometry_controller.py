@@ -3,7 +3,12 @@ import numpy as np
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication, QProgressDialog, QWidget
 from mvc.controllers.background_work import BackgroundCall
-from mvc.models.registration import SimpleITKRegistrar, default_registration_config
+from mvc.models.registration import (
+    SimpleITKRegistrar,
+    coarse_liver_requested,
+    default_registration_config,
+    with_coarse_liver_mask,
+)
 import pydicom
 from datetime import datetime
 import csv
@@ -134,7 +139,7 @@ class ThermometryController:
                 fixed_imag=self.model.imag1,
                 moving_real=self.model.real2,
                 moving_imag=self.model.imag2,
-                config=self.registration_config,
+                config=self._registration_config_for_run(),
                 spacing_mm=self._pixel_spacing(),
             )
         except Exception as exc:  # e.g. shape mismatch; keep the UI responsive
@@ -214,7 +219,9 @@ class ThermometryController:
         snapshot = self._image_snapshot()
         arrays = self._registration_arrays()
         registrar = self.registrar
-        config = self.registration_config
+        # Read the checkbox here, on the UI thread.  The worker must not
+        # touch the widget, and the stored preset is left unchanged.
+        config = self._registration_config_for_run()
         spacing_mm = self._pixel_spacing()
 
         def work():
@@ -251,6 +258,19 @@ class ThermometryController:
                 snapshot,
                 generation,
             ),
+        )
+
+    def _registration_config_for_run(self):
+        """Config for this correction.  The stored preset is not mutated.
+
+        The coarse liver checkbox replaces only ``mask_kind``.  The metric
+        and the transform stay on the injected config.  A view without the
+        checkbox, which is how the tests build one, keeps that config
+        object.
+        """
+        return with_coarse_liver_mask(
+            self.registration_config,
+            coarse_liver_requested(self.view),
         )
 
     def calculate_temperature(self, original_temperature, apply_gaussian, apply_b0_correction, apply_motion_correction):

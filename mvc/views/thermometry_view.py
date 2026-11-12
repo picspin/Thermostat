@@ -246,9 +246,22 @@ class ThermometryView(QMainWindow):
         self.motion_correction_checkbox = QCheckBox('Apply Motion Correction', self)
         self.motion_correction_checkbox.setToolTip(
             'Uses elastic registration with the 1st real image as reference. '
-            'For a Cinema sequence, every later frame is registered to the first frame.'
+            'For a Cinema sequence, every later frame is registered to the first frame. '
+            'The mask stays the Otsu tissue mask unless "Use coarse liver ROI" is also checked.'
         )
         options_layout.addWidget(self.motion_correction_checkbox)
+
+        # Off by default.  Motion correction keeps the Otsu tissue mask
+        # until this is checked; checking it alone does not register.
+        self.coarse_liver_checkbox = QCheckBox('Use coarse liver ROI', self)
+        self.coarse_liver_checkbox.setToolTip(
+            'Off by default. When motion correction is also on, the metric '
+            'uses a coarse liver interior instead of the Otsu tissue mask: '
+            'tissue above the corner air estimate, with about 20 mm of body '
+            'wall removed. This is not a liver segmentation. It does nothing '
+            'unless motion correction is checked.'
+        )
+        options_layout.addWidget(self.coarse_liver_checkbox)
         
         options_group.setLayout(options_layout)
         left_layout.addWidget(options_group)
@@ -677,6 +690,7 @@ class ThermometryView(QMainWindow):
         self.gaussian_filter_checkbox.setChecked(False)
         self.b0_correction_checkbox.setChecked(False)
         self.motion_correction_checkbox.setChecked(False)
+        self.coarse_liver_checkbox.setChecked(False)
         self.dicom_info.clear()
         self.roi_results.clear()
         self.temperature_map = None
