@@ -258,8 +258,9 @@ class ThermometryView(QMainWindow):
             'Off by default. When motion correction is also on, the metric '
             'uses a coarse liver interior instead of the Otsu tissue mask: '
             'tissue above the corner air estimate, with about 20 mm of body '
-            'wall removed. This is not a liver segmentation. It does nothing '
-            'unless motion correction is checked.'
+            'wall removed. The ROI is taken from the magnitude image, not '
+            'the real component. This is not a liver segmentation. It does '
+            'nothing unless motion correction is checked.'
         )
         options_layout.addWidget(self.coarse_liver_checkbox)
         

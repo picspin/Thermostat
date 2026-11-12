@@ -424,7 +424,7 @@ def test_foreground_percentile_is_rejected_outside_0_to_100():
 
 def test_execute_failure_is_reported_in_the_result():
     class FailingRegistrar(SimpleITKRegistrar):
-        def _execute(self, fixed_image, moving_image, config):
+        def _execute(self, fixed_image, moving_image, config, **_kwargs):
             raise RuntimeError("simulated registration failure")
 
     fixed = _phantom()

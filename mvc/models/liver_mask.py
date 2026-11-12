@@ -62,10 +62,14 @@ def require_positive_mm(name, value):
 def coarse_liver_mask(image, wall_mm=COARSE_LIVER_WALL_MM):
     """Return a UInt8 mask, 1 on the coarse liver interior.
 
-    ``image`` is a SimpleITK magnitude image in 2D or 3D.  The input is
-    not modified.  Non-finite voxels are set darker than every finite
-    voxel, so the threshold cannot mark them as tissue.  One that is
-    enclosed by tissue is filled later, the same way a vessel is.
+    ``image`` is a SimpleITK magnitude image in 2D or 3D.  A complex
+    pair has to be turned into ``hypot(real, imag)`` before this call.
+    The signed real component is not a magnitude: a phase shift can
+    select the body wall or drop the liver, and this function does not
+    take the absolute value.  The input is not modified.  Non-finite
+    voxels are set darker than every finite voxel, so the threshold
+    cannot mark them as tissue.  One that is enclosed by tissue is
+    filled later, the same way a vessel is.
 
     Steps, in order:
 

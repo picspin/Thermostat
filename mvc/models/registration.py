@@ -10,7 +10,8 @@ Mattes MI.  The motion-correction checkbox uses
 ``RegistrationConfig.liver_respiratory()`` instead: rigid, then a coarse
 B-spline, with local correlation and an Otsu mask.  ``metric="mind"`` is an
 explicit extra similarity.  ``mask_kind="coarse_liver"`` is an explicit
-extra mask: a coarse liver interior that drops the body wall Otsu keeps.
+extra mask: a coarse liver interior, measured on the complex magnitude,
+that drops the body wall Otsu keeps.
 Neither default selects either one.  The "Use coarse liver ROI" checkbox
 is the only UI path that switches the mask, and only while motion
 correction itself is on.
@@ -96,7 +97,10 @@ class RegistrationConfig:
             ``"coarse_liver"`` is opt-in.  It keeps every tissue class
             above the corner air estimate and erodes the body wall.  It is
             still not a liver segmentation.  ``liver_respiratory()`` does
-            not select it.
+            not select it.  The mask is built from ``hypot(real, imag)``,
+            not from the signed real component; a missing imaginary
+            component uses ``|real|``.  The metric itself still sees the
+            real component.
         dilation_mm: Physical radius of the Otsu dilation.  Ignored by the
             other masks.
         liver_wall_mm: Physical body-wall thickness removed by
@@ -289,7 +293,10 @@ class SimpleITKRegistrar:
     at the image center and optimized with regular-step gradient descent,
     because the B-spline step size does not recover rotation.  That choice
     does not change the default B-spline path.  The transform is estimated
-    from the real component and then applied to both components.
+    from the real component and then applied to both components.  The
+    coarse liver mask is the exception: it is built from the complex
+    magnitude, because a phase change on the real component can select
+    the body wall or erase the liver.
     """
 
     _METRIC_NAMES = {
@@ -316,9 +323,13 @@ class SimpleITKRegistrar:
     ) -> RegistrationResult:
         """Register ``moving_real`` to ``fixed_real`` and warp both components.
 
-        ``fixed_imag`` is accepted so callers can pass the complete complex
-        pair; the current implementation estimates the transform from the real
-        component only (matching the historical behavior).
+        The transform is estimated from the real component, matching the
+        historical behavior.  ``fixed_imag`` and ``moving_imag`` are not
+        metric inputs.  When ``mask_kind`` is ``"coarse_liver"`` they are
+        the second half of the mask input: that mask is built from
+        ``hypot(real, imag)``.  A missing imaginary array uses ``|real|``
+        for that image only.  Otsu and percentile masks still see the real
+        component, so a phase change does not retune them.
         """
         config = config or RegistrationConfig()
         if fixed_real is None or moving_real is None:
@@ -337,9 +348,20 @@ class SimpleITKRegistrar:
             moving_image = sitk.GetImageFromArray(moving_array)
             _assign_spacing(fixed_image, spacing_mm)
             _assign_spacing(moving_image, spacing_mm)
+            # Only the coarse liver mask sees magnitude.  Building it for
+            # every run would also change the Otsu and percentile masks,
+            # which are still defined on the real component.
+            mask_images = None
+            if _active_mask_kind(config) == "coarse_liver":
+                mask_images = (
+                    _complex_magnitude_image(fixed_array, fixed_imag, fixed_image),
+                    _complex_magnitude_image(
+                        moving_array, moving_imag, moving_image
+                    ),
+                )
 
             final_transform, method = self._execute(
-                fixed_image, moving_image, config
+                fixed_image, moving_image, config, mask_images=mask_images
             )
             interpolator = self._interpolator(config.interpolator)
 
@@ -416,10 +438,13 @@ class SimpleITKRegistrar:
         moving_image,
         config,
         moving_initial_transform=None,
+        mask_images=None,
     ):
         """Build and run one stage; returns (transform, method)."""
         if config.transform_kind == "rigid_bspline":
-            return self._execute_cascade(fixed_image, moving_image, config)
+            return self._execute_cascade(
+                fixed_image, moving_image, config, mask_images=mask_images
+            )
         if config.metric == "mind":
             # Built-in metrics cannot consume a neighbourhood descriptor.
             # Leaving this above the SimpleITK block keeps that block on
@@ -429,6 +454,7 @@ class SimpleITKRegistrar:
                 moving_image,
                 config,
                 moving_initial_transform,
+                mask_images=mask_images,
             )
         method = sitk.ImageRegistrationMethod()
         self._configure_metric(method, config)
@@ -442,7 +468,9 @@ class SimpleITKRegistrar:
         )
         self._configure_pyramid(method, config)
         method.SetInterpolator(self._interpolator(config.interpolator))
-        self._configure_mask(method, fixed_image, moving_image, config)
+        self._configure_mask(
+            method, fixed_image, moving_image, config, mask_images=mask_images
+        )
 
         transform = self._initial_transform(fixed_image, moving_image, config)
         if moving_initial_transform is not None:
@@ -458,18 +486,22 @@ class SimpleITKRegistrar:
         final_transform = method.Execute(fixed_image, moving_image)
         return final_transform, method
 
-    def _execute_cascade(self, fixed_image, moving_image, config):
+    def _execute_cascade(
+        self, fixed_image, moving_image, config, mask_images=None
+    ):
         """Rigid alignment, then a B-spline on that result."""
         rigid_tx, _ = self._execute(
             fixed_image,
             moving_image,
             replace(config, transform_kind="rigid"),
+            mask_images=mask_images,
         )
         bspline_tx, method = self._execute(
             fixed_image,
             moving_image,
             replace(config, transform_kind="bspline"),
             moving_initial_transform=rigid_tx,
+            mask_images=mask_images,
         )
         composite = sitk.CompositeTransform(fixed_image.GetDimension())
         composite.AddTransform(rigid_tx)
@@ -482,6 +514,7 @@ class SimpleITKRegistrar:
         moving_image,
         config,
         moving_initial_transform=None,
+        mask_images=None,
     ):
         """Minimize the MIND distance on the same initial transform.
 
@@ -489,12 +522,14 @@ class SimpleITKRegistrar:
         on the original voxel grid, so the intensity pyramid is not applied
         either.  Masks are the same Otsu, percentile, or coarse-liver masks
         as the other metrics; they only choose which voxels the descriptor
-        distance sees.
+        distance sees.  The coarse liver mask still comes from
+        ``mask_images`` (the magnitude), not from the real component being
+        optimized.
         """
 
         transform = self._initial_transform(fixed_image, moving_image, config)
         fixed_mask, moving_mask = self._metric_masks(
-            fixed_image, moving_image, config
+            fixed_image, moving_image, config, mask_images=mask_images
         )
         outcome = optimize_mind(
             fixed_image,
@@ -512,8 +547,17 @@ class SimpleITKRegistrar:
             outcome.value, outcome.iterations, outcome.stop_condition
         )
 
-    def _metric_masks(self, fixed_image, moving_image, config):
-        """Fixed and moving masks, or ``(None, None)`` when the metric is unmasked."""
+    def _metric_masks(
+        self, fixed_image, moving_image, config, mask_images=None
+    ):
+        """Fixed and moving masks, or ``(None, None)`` when the metric is unmasked.
+
+        ``mask_images`` is only read for ``coarse_liver``.  Otsu and
+        percentile stay on ``fixed_image`` / ``moving_image``, the real
+        component the metric is optimizing.  When ``mask_images`` is
+        omitted, the coarse mask uses those images directly, which is
+        correct only when they are already magnitudes.
+        """
 
         kind = _active_mask_kind(config)
         if kind == "none":
@@ -524,9 +568,13 @@ class SimpleITKRegistrar:
                 self._foreground_mask(moving_image, config.foreground_percentile),
             )
         if kind == "coarse_liver":
+            if mask_images is None:
+                fixed_source, moving_source = fixed_image, moving_image
+            else:
+                fixed_source, moving_source = mask_images
             return (
-                coarse_liver_mask(fixed_image, config.liver_wall_mm),
-                coarse_liver_mask(moving_image, config.liver_wall_mm),
+                coarse_liver_mask(fixed_source, config.liver_wall_mm),
+                coarse_liver_mask(moving_source, config.liver_wall_mm),
             )
         return (
             self._otsu_dilated_mask(fixed_image, config.dilation_mm),
@@ -578,9 +626,11 @@ class SimpleITKRegistrar:
             mesh.append(max(1, int(round(physical / step_mm))))
         return mesh
 
-    def _configure_mask(self, method, fixed_image, moving_image, config):
+    def _configure_mask(
+        self, method, fixed_image, moving_image, config, mask_images=None
+    ):
         fixed_mask, moving_mask = self._metric_masks(
-            fixed_image, moving_image, config
+            fixed_image, moving_image, config, mask_images=mask_images
         )
         if fixed_mask is None:
             return
@@ -760,6 +810,30 @@ def _active_mask_kind(config):
     if config.mask_kind == "percentile" or config.foreground_mask:
         return "percentile"
     return "none"
+
+
+def _complex_magnitude_image(real, imag, like):
+    """Magnitude image for the coarse liver mask, in ``like``'s geometry.
+
+    The metric image stays the real component.  Both components use
+    ``hypot``; a missing imaginary component uses ``|real|``.  ``|real|``
+    repairs a sign flip, but a quadrature phase (real near 0, signal in
+    the imaginary part) still needs ``hypot``.
+    """
+    real_array = np.asarray(real, dtype=np.float64)
+    if imag is None:
+        magnitude = np.abs(real_array)
+    else:
+        imag_array = np.asarray(imag, dtype=np.float64)
+        if imag_array.shape != real_array.shape:
+            raise ValueError(
+                "imaginary component must have the same shape as the real "
+                f"component, got {imag_array.shape} and {real_array.shape}"
+            )
+        magnitude = np.hypot(real_array, imag_array)
+    image = sitk.GetImageFromArray(magnitude)
+    image.CopyInformation(like)
+    return image
 
 
 def _assign_spacing(image, spacing_mm):
