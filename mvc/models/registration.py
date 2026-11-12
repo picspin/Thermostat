@@ -554,9 +554,11 @@ class SimpleITKRegistrar:
 
         ``mask_images`` is only read for ``coarse_liver``.  Otsu and
         percentile stay on ``fixed_image`` / ``moving_image``, the real
-        component the metric is optimizing.  When ``mask_images`` is
-        omitted, the coarse mask uses those images directly, which is
-        correct only when they are already magnitudes.
+        component the metric is optimizing.  Omitting ``mask_images`` for
+        the coarse liver mask is an error: those metric images are the
+        signed real component, and using them recreates the phase failure
+        this mask exists to avoid.  ``register_complex`` always passes the
+        magnitude pair.
         """
 
         kind = _active_mask_kind(config)
@@ -569,9 +571,11 @@ class SimpleITKRegistrar:
             )
         if kind == "coarse_liver":
             if mask_images is None:
-                fixed_source, moving_source = fixed_image, moving_image
-            else:
-                fixed_source, moving_source = mask_images
+                raise ValueError(
+                    "coarse liver mask requires magnitude images; "
+                    "the real component is not a magnitude"
+                )
+            fixed_source, moving_source = mask_images
             return (
                 coarse_liver_mask(fixed_source, config.liver_wall_mm),
                 coarse_liver_mask(moving_source, config.liver_wall_mm),

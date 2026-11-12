@@ -221,6 +221,7 @@ def test_registrar_uses_the_coarse_mask_and_ignores_the_knob_otherwise():
         fixed,
         moving,
         RegistrationConfig(mask_kind="coarse_liver", liver_wall_mm=20.0),
+        mask_images=(fixed, moving),
     )
     mask = sitk.GetArrayFromImage(fixed_mask)
     assert mask[20, 60] == 0
@@ -232,6 +233,7 @@ def test_registrar_uses_the_coarse_mask_and_ignores_the_knob_otherwise():
         fixed,
         moving,
         RegistrationConfig(mask_kind="coarse_liver", foreground_mask=True),
+        mask_images=(fixed, moving),
     )
     assert sitk.GetArrayFromImage(overridden)[20, 60] == 0
 
@@ -584,6 +586,7 @@ def test_otsu_mask_still_sees_the_real_component_when_phase_varies():
     ("transform_kind", "metric"),
     [
         ("rigid", "mattes_mi"),
+        ("affine", "mattes_mi"),
         ("rigid", "mind"),
         ("bspline", "mind"),
         ("rigid_bspline", "correlation"),
@@ -606,4 +609,85 @@ def test_every_coarse_liver_path_masks_the_magnitude(transform_kind, metric):
     np.testing.assert_array_equal(
         sitk.GetArrayFromImage(probe.mask_images[0]), np.hypot(real, imag)
     )
+
+
+def test_coarse_liver_without_magnitude_images_is_rejected():
+    # Passing the signed real images and forgetting the magnitude pair
+    # must not silently rebuild the body-wall ROI from issue 18.
+    magnitude = _wall_box_phantom()
+    real, _imag = _phase_ramp(magnitude)
+    signed = _image(real, (1.0, 1.0))
+    magnitude_image = _image(magnitude, (1.0, 1.0))
+
+    with pytest.raises(ValueError, match="magnitude"):
+        SimpleITKRegistrar()._metric_masks(
+            signed,
+            signed,
+            RegistrationConfig(mask_kind="coarse_liver"),
+        )
+
+    fixed_mask, _moving_mask = SimpleITKRegistrar()._metric_masks(
+        signed,
+        signed,
+        RegistrationConfig(mask_kind="coarse_liver", liver_wall_mm=20.0),
+        mask_images=(magnitude_image, magnitude_image),
+    )
+    mask = sitk.GetArrayFromImage(fixed_mask)
+    assert mask[50, 55] == 1
+    assert mask[20, 60] == 0
+
+
+def test_complex_magnitude_keeps_direction_and_origin():
+    from mvc.models.registration import _complex_magnitude_image
+
+    magnitude = _wall_box_phantom()
+    real, imag = _phase_ramp(magnitude)
+    like = _image(magnitude, (2.0, 1.0))
+    like.SetOrigin((3.0, -4.0))
+    like.SetDirection((-1.0, 0.0, 0.0, 1.0))
+
+    image = _complex_magnitude_image(real, imag, like)
+
+    assert image.GetSpacing() == (2.0, 1.0)
+    assert image.GetOrigin() == (3.0, -4.0)
+    assert tuple(image.GetDirection()) == (-1.0, 0.0, 0.0, 1.0)
+    np.testing.assert_allclose(
+        sitk.GetArrayFromImage(image), np.hypot(real, imag)
+    )
+
+
+def test_phase_ramp_registration_aligns_the_liver_core():
+    magnitude = _wall_box_phantom()
+    real, imag = _phase_ramp(magnitude)
+    moving_real = np.roll(real, (2, -1), axis=(0, 1))
+    moving_imag = np.roll(imag, (2, -1), axis=(0, 1))
+    # Interior of the eroded liver, away from the roll seam.
+    core = (slice(46, 56), slice(48, 58))
+    before = float(np.mean(np.abs(real[core] - moving_real[core])))
+    imag_before = float(np.mean(np.abs(imag[core] - moving_imag[core])))
+
+    result = SimpleITKRegistrar().register_complex(
+        real,
+        imag,
+        moving_real,
+        moving_imag,
+        RegistrationConfig(
+            random_seed=1234,
+            iterations=12,
+            shrink_factors=(2, 1),
+            smoothing_sigmas=(0.0, 0.0),
+            sampling_percentage=0.5,
+            transform_kind="rigid",
+            mask_kind="coarse_liver",
+            liver_wall_mm=20.0,
+        ),
+        spacing_mm=(1.0, 1.0),
+    )
+
+    assert result.succeeded
+    assert result.warped_imag is not None
+    after = float(np.mean(np.abs(real[core] - result.warped_real[core])))
+    imag_after = float(np.mean(np.abs(imag[core] - result.warped_imag[core])))
+    assert after < before
+    assert imag_after < imag_before
 
