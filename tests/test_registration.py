@@ -348,11 +348,13 @@ def test_liver_preset_is_the_checkbox_configuration():
     assert config.neighborhood_radius == 4
     assert config.mask_kind == "otsu_dilated"
     assert config.dilation_mm == 12.0
+    assert config.liver_wall_mm == 20.0
     assert config.bspline_grid_spacing_mm == 40.0
     # The no-argument config stays the historical single stage.
     assert RegistrationConfig().transform_kind == "bspline"
     assert RegistrationConfig().metric == "mattes_mi"
     assert RegistrationConfig().mask_kind == "none"
+    assert RegistrationConfig().liver_wall_mm == 20.0
 
 
 def test_otsu_mask_drops_distant_air_and_dilates():

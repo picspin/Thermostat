@@ -9,6 +9,11 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QTimer
 from mvc.controllers.background_work import BackgroundCall
+from mvc.models.registration import (
+    RegistrationConfig,
+    coarse_liver_requested,
+    with_coarse_liver_mask,
+)
 from mvc.models.thermal_dose import (
     CONSECUTIVE_PAIR_DOSE_MESSAGE,
     ThermalDoseError,
@@ -29,11 +34,13 @@ class AdvancedFeaturesController:
 
         ``registrar`` and ``registration_config`` are optional.  The GUI
         passes the thermometry controller's registrar and its
-        liver-respiratory config, so a checked box registers every later
-        frame to the first frame with that preset.  If the caller omits
-        the registrar, ``CinemaModel`` creates one and, when no config was
-        passed either, uses the same preset.  The sequence still does not
-        register unless the checkbox is checked.
+        liver-respiratory config, so a checked motion-correction box
+        registers every later frame to the first frame with that preset.
+        If the caller omits the registrar, ``CinemaModel`` creates one and,
+        when no config was passed either, uses the same preset.  The
+        sequence still does not register unless that checkbox is checked.
+        "Use coarse liver ROI" is a second checkbox.  It stays off by
+        default and, when checked, replaces only the mask.
         """
         self.view = view
         self.cinema_model = cinema_model
@@ -117,6 +124,10 @@ class AdvancedFeaturesController:
             if self._cinema_job is None:
                 self._cinema_job = BackgroundCall()
 
+            # The checkbox is read on this thread.  The worker only receives
+            # the resulting config, and the stored preset is not mutated.
+            registration_config = self._registration_config_for_run()
+
             def work():
                 return self.cinema_model.calculate_temperature_sequence(
                     real_files,
@@ -126,7 +137,7 @@ class AdvancedFeaturesController:
                     apply_b0_correction,
                     apply_motion_correction=apply_motion_correction,
                     registrar=self.registrar,
-                    registration_config=self.registration_config,
+                    registration_config=registration_config,
                     stop_event=self._cinema_stop,
                 )
 
@@ -141,6 +152,27 @@ class AdvancedFeaturesController:
             traceback.print_exc()
             self.view.show_error(f"Error generating cinema: {str(e)}")
             self._close_cinema_progress()
+
+    def _registration_config_for_run(self):
+        """Config for this sequence.  Unchecked returns the stored object.
+
+        Checked swaps in the coarse liver mask and leaves the metric and
+        transform alone.  A missing config uses the fallback CinemaModel
+        would have built: the liver preset when this controller also has
+        no registrar, and the historical Mattes B-spline when the caller
+        brought a registrar but no config.  Passing that object in means
+        CinemaModel does not replace it.
+        """
+        enabled = coarse_liver_requested(self.view)
+        if not enabled:
+            return self.registration_config
+        if self.registration_config is not None:
+            return with_coarse_liver_mask(self.registration_config, True)
+        if self.registrar is None:
+            fallback = RegistrationConfig.liver_respiratory()
+        else:
+            fallback = RegistrationConfig()
+        return with_coarse_liver_mask(None, True, fallback=fallback)
 
     def _request_cinema_cancel(self):
         """Stop before the next frame.  The current frame is left as it is."""

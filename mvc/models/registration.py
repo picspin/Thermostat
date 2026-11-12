@@ -9,7 +9,11 @@ the original acquired images intact.
 Mattes MI.  The motion-correction checkbox uses
 ``RegistrationConfig.liver_respiratory()`` instead: rigid, then a coarse
 B-spline, with local correlation and an Otsu mask.  ``metric="mind"`` is an
-explicit extra similarity.  Neither default selects it.
+explicit extra similarity.  ``mask_kind="coarse_liver"`` is an explicit
+extra mask: a coarse liver interior that drops the body wall Otsu keeps.
+Neither default selects either one.  The "Use coarse liver ROI" checkbox
+is the only UI path that switches the mask, and only while motion
+correction itself is on.
 """
 
 from __future__ import annotations
@@ -21,6 +25,11 @@ from typing import Any, Optional, Tuple
 import numpy as np
 import SimpleITK as sitk
 
+from mvc.models.liver_mask import (
+    COARSE_LIVER_WALL_MM,
+    coarse_liver_mask,
+    require_positive_mm,
+)
 from mvc.models.mind import (
     MIND_RADIUS,
     MIND_SAMPLE_STRIDE,
@@ -80,10 +89,20 @@ class RegistrationConfig:
             by that mask.
         neighborhood_radius: Voxel radius for local NCC.  Ignored by the
             other metrics.  4 is inside the requested 3–5 voxel range.
-        mask_kind: ``"none"``, ``"percentile"``, or ``"otsu_dilated"``.
-            The dilated Otsu mask is a coarse tissue mask, not a liver
-            segmentation.  It drops air and adds a rim around the tissue.
-        dilation_mm: Physical radius of that dilation.
+        mask_kind: ``"none"``, ``"percentile"``, ``"otsu_dilated"``, or
+            ``"coarse_liver"``.  The dilated Otsu mask is a coarse tissue
+            mask, not a liver segmentation.  It drops air and adds a rim
+            around the tissue, so the body wall stays inside.
+            ``"coarse_liver"`` is opt-in.  It keeps every tissue class
+            above the corner air estimate and erodes the body wall.  It is
+            still not a liver segmentation.  ``liver_respiratory()`` does
+            not select it.
+        dilation_mm: Physical radius of the Otsu dilation.  Ignored by the
+            other masks.
+        liver_wall_mm: Physical body-wall thickness removed by
+            ``mask_kind="coarse_liver"``.  Ignored by the other masks.
+            20 mm is the default: thick enough to drop a typical adult
+            wall, thinner than a normal right lobe.
         bspline_grid_spacing_mm: When set, the B-spline mesh is sized from
             the image's physical extent.  ``None`` keeps ``mesh_size``.
         mind_radius: Chebyshev radius of the MIND stencil.  Ignored unless
@@ -126,6 +145,7 @@ class RegistrationConfig:
     neighborhood_radius: int = 4
     mask_kind: str = "none"
     dilation_mm: float = 12.0
+    liver_wall_mm: float = COARSE_LIVER_WALL_MM
     bspline_grid_spacing_mm: Optional[float] = None
     mind_radius: int = MIND_RADIUS
     mind_sample_stride: int = MIND_SAMPLE_STRIDE
@@ -137,12 +157,13 @@ class RegistrationConfig:
                 "Unsupported transform_kind: "
                 f"{self.transform_kind!r}. Expected one of {transforms}."
             )
-        masks = ("none", "percentile", "otsu_dilated")
+        masks = ("none", "percentile", "otsu_dilated", "coarse_liver")
         if self.mask_kind not in masks:
             raise ValueError(
                 f"Unsupported mask_kind: {self.mask_kind!r}. "
                 f"Expected one of {masks}."
             )
+        require_positive_mm("liver_wall_mm", self.liver_wall_mm)
         if not 0.0 <= float(self.foreground_percentile) <= 100.0:
             raise ValueError(
                 "foreground_percentile must be between 0 and 100, "
@@ -172,6 +193,8 @@ class RegistrationConfig:
         Local NCC uses a 4-voxel radius.  The mask is Otsu plus a 12 mm
         dilation, inside the requested 10–15 mm range.  SimpleITK has no
         bending-energy metric, so the coarse grid is the regularizer.
+        The coarse liver ROI is not part of this preset; it stays off
+        unless ``mask_kind="coarse_liver"`` or the UI checkbox is checked.
         """
         return cls(
             metric="ants_neighborhood_correlation",
@@ -187,6 +210,38 @@ class RegistrationConfig:
 def default_registration_config() -> RegistrationConfig:
     """Configuration used when the user turns motion correction on."""
     return RegistrationConfig.liver_respiratory()
+
+
+def coarse_liver_requested(view) -> bool:
+    """True only when the coarse-liver checkbox exists and is checked.
+
+    Views used by tests, and any caller that never built the checkbox,
+    stay on the mask already stored in the registration config.  The
+    checkbox defaults to unchecked.
+    """
+    box = getattr(view, "coarse_liver_checkbox", None)
+    is_checked = getattr(box, "isChecked", None)
+    if not callable(is_checked):
+        return False
+    return bool(is_checked())
+
+
+def with_coarse_liver_mask(config, enabled, fallback=None):
+    """Return ``config`` with the coarse liver mask, without mutating it.
+
+    ``enabled`` false returns ``config`` itself, including ``None``.
+    ``fallback`` is used only when the mask is requested and ``config``
+    is ``None``, so a cinema run can keep the preset it would have built
+    and change only the mask.
+    """
+    if not enabled:
+        return config
+    base = config if config is not None else fallback
+    if base is None:
+        base = RegistrationConfig()
+    if base.mask_kind == "coarse_liver":
+        return base
+    return replace(base, mask_kind="coarse_liver")
 
 
 @dataclass
@@ -432,8 +487,9 @@ class SimpleITKRegistrar:
 
         The SimpleITK optimizer below is not used.  Radius and stride stay
         on the original voxel grid, so the intensity pyramid is not applied
-        either.  Masks are the same Otsu or percentile masks as the other
-        metrics; they only choose which voxels the descriptor distance sees.
+        either.  Masks are the same Otsu, percentile, or coarse-liver masks
+        as the other metrics; they only choose which voxels the descriptor
+        distance sees.
         """
 
         transform = self._initial_transform(fixed_image, moving_image, config)
@@ -466,6 +522,11 @@ class SimpleITKRegistrar:
             return (
                 self._foreground_mask(fixed_image, config.foreground_percentile),
                 self._foreground_mask(moving_image, config.foreground_percentile),
+            )
+        if kind == "coarse_liver":
+            return (
+                coarse_liver_mask(fixed_image, config.liver_wall_mm),
+                coarse_liver_mask(moving_image, config.liver_wall_mm),
             )
         return (
             self._otsu_dilated_mask(fixed_image, config.dilation_mm),
@@ -694,6 +755,8 @@ def _require_positive_int(name, value):
 def _active_mask_kind(config):
     if config.mask_kind == "otsu_dilated":
         return "otsu_dilated"
+    if config.mask_kind == "coarse_liver":
+        return "coarse_liver"
     if config.mask_kind == "percentile" or config.foreground_mask:
         return "percentile"
     return "none"
