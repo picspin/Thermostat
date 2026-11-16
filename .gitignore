@@ -2,3 +2,9 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+
+# Windows build artifacts — never commit exe, zip, build or dist
+dist/
+build/
+*.spec
+*.zip
