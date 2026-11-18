@@ -235,8 +235,8 @@ class RegistrationConfig:
 
         Head motion is predominantly rigid, so this is an Euler
         transform rather than the abdominal respiratory grid.  It does
-        not select ``mask_kind="coarse_liver"``.  The numeric fields
-        match ``joint()``; only the site name differs.
+        not select ``mask_kind="coarse_liver"``.  The config is identical
+        to ``joint()``; there is no separate site field.
         """
         return cls._rigid_site()
 

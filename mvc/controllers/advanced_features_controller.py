@@ -175,19 +175,21 @@ class AdvancedFeaturesController:
             return config_for_body_part(self.registration_config, body)
         if self.registration_config is not None:
             return with_coarse_liver_mask(self.registration_config, True)
-        fallback = self._body_fallback(body)
-        return with_coarse_liver_mask(None, True, fallback=fallback)
+        # ``requested`` is true only when the site is abdomen, so a
+        # missing config uses the abdomen fallback.  Head and joint
+        # return above, from ``config_for_body_part``.
+        return with_coarse_liver_mask(
+            None, True, fallback=self._abdomen_fallback()
+        )
 
-    def _body_fallback(self, body):
-        """Fallback when no config was stored and the mask was requested.
+    def _abdomen_fallback(self):
+        """Abdomen config used when the coarse liver mask was requested
+        and nothing was stored.
 
-        Head and joint do not take the coarse liver mask, so the
-        requested path is abdomen: the liver preset when this controller
-        has no registrar, and the historical Mattes B-spline when the
-        caller brought a registrar but no config.
+        No registrar means the liver preset.  A registrar without a
+        config means the historical Mattes B-spline, which is what
+        ``CinemaModel`` would have used.
         """
-        if not coarse_liver_available(body):
-            return config_for_body_part(None, body)
         if self.registrar is None:
             return RegistrationConfig.liver_respiratory()
         return RegistrationConfig()
