@@ -15,6 +15,10 @@ from matplotlib.patches import Polygon
 import numpy as np
 import os
 from datetime import datetime
+from mvc.models.registration import (
+    coarse_liver_checkbox_transition,
+    registration_site_from_label,
+)
 
 class ROIManager:
     """Manages ROI drawing and stats calculation."""
@@ -284,6 +288,8 @@ class ThermometryView(QMainWindow):
             'Only available for Abdomen body part.'
         )
         options_layout.addWidget(self.coarse_liver_checkbox)
+        # Abdomen check state saved while Head or Joint is selected.
+        self._coarse_liver_for_abdomen = None
         
         options_group.setLayout(options_layout)
         left_layout.addWidget(options_group)
@@ -456,11 +462,20 @@ class ThermometryView(QMainWindow):
         self.reset_ui()
 
     def _on_registration_site_changed(self, text):
-        """Enable the coarse liver checkbox only when Abdomen is selected."""
-        available = text == "Abdomen"
-        self.coarse_liver_checkbox.setEnabled(available)
-        if not available:
-            self.coarse_liver_checkbox.setChecked(False)
+        """Enable the coarse liver checkbox only for the abdomen site.
+
+        Leaving abdomen remembers the check.  Coming back restores it,
+        including a switch Head -> Joint -> Abdomen.
+        """
+        site = registration_site_from_label(text)
+        checked, enabled, remembered = coarse_liver_checkbox_transition(
+            site,
+            self.coarse_liver_checkbox.isChecked(),
+            self._coarse_liver_for_abdomen,
+        )
+        self._coarse_liver_for_abdomen = remembered
+        self.coarse_liver_checkbox.setEnabled(enabled)
+        self.coarse_liver_checkbox.setChecked(checked)
         
     def on_save_temperature_map(self):
         file, _ = QFileDialog.getSaveFileName(self, "Save Temperature Map", "", "JPEG Files (*.jpg);;PNG Files (*.png)")
@@ -719,8 +734,13 @@ class ThermometryView(QMainWindow):
         self.gaussian_filter_checkbox.setChecked(False)
         self.b0_correction_checkbox.setChecked(False)
         self.motion_correction_checkbox.setChecked(False)
+        # Drop any remembered abdomen check before the combo signal runs.
+        self._coarse_liver_for_abdomen = None
+        self.coarse_liver_checkbox.setEnabled(True)
         self.coarse_liver_checkbox.setChecked(False)
+        self.registration_site_combo.blockSignals(True)
         self.registration_site_combo.setCurrentIndex(0)  # Abdomen
+        self.registration_site_combo.blockSignals(False)
         self.dicom_info.clear()
         self.roi_results.clear()
         self.temperature_map = None

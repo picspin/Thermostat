@@ -12,7 +12,9 @@ from mvc.controllers.background_work import BackgroundCall
 from mvc.models.registration import (
     RegistrationConfig,
     body_part_from_view,
+    coarse_liver_available,
     coarse_liver_requested,
+    config_for_body_part,
     with_coarse_liver_mask,
 )
 from mvc.models.thermal_dose import (
@@ -166,28 +168,26 @@ class AdvancedFeaturesController:
         replace it.
         """
         body = body_part_from_view(self.view)
-        requested = coarse_liver_requested(self.view) and body == "abdomen"
+        requested = (
+            coarse_liver_requested(self.view) and coarse_liver_available(body)
+        )
         if not requested:
-            return self._base_for_body_part(body)
+            return config_for_body_part(self.registration_config, body)
         if self.registration_config is not None:
             return with_coarse_liver_mask(self.registration_config, True)
         fallback = self._body_fallback(body)
         return with_coarse_liver_mask(None, True, fallback=fallback)
 
-    def _base_for_body_part(self, body):
-        """Config for the body part without the coarse liver mask override."""
-        if body == "head":
-            return RegistrationConfig.head()
-        if body == "joint":
-            return RegistrationConfig.joint()
-        return self.registration_config
-
     def _body_fallback(self, body):
-        """Fallback config for the body part when the stored config is None."""
-        if body == "head":
-            return RegistrationConfig.head()
-        if body == "joint":
-            return RegistrationConfig.joint()
+        """Fallback when no config was stored and the mask was requested.
+
+        Head and joint do not take the coarse liver mask, so the
+        requested path is abdomen: the liver preset when this controller
+        has no registrar, and the historical Mattes B-spline when the
+        caller brought a registrar but no config.
+        """
+        if not coarse_liver_available(body):
+            return config_for_body_part(None, body)
         if self.registrar is None:
             return RegistrationConfig.liver_respiratory()
         return RegistrationConfig()

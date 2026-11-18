@@ -1,5 +1,7 @@
 """Controller integration tests: registration result handling and fallbacks."""
 
+import logging
+
 import numpy as np
 
 from mvc.controllers.thermometry_controller import ThermometryController
@@ -325,6 +327,25 @@ def test_joint_does_not_use_coarse_liver_even_when_checked():
     config = registrar.calls[0]["config"]
     assert config.mask_kind != "coarse_liver"
     assert config.transform_kind == "rigid"
+
+
+def test_head_site_logs_when_it_replaces_a_stored_config(caplog):
+    controller, _, view, registrar = _controller(_result())
+    controller.registration_config = RegistrationConfig(metric="mind")
+    view.coarse_liver_checkbox = _CheckBox(True)
+    view.registration_site_combo = _Combo("Head")
+
+    with caplog.at_level(logging.INFO, logger="mvc.models.registration"):
+        assert controller.apply_motion_correction() is True
+
+    config = registrar.calls[0]["config"]
+    assert config == RegistrationConfig.head()
+    assert config.metric != "mind"
+    assert config.mask_kind != "coarse_liver"
+    assert any(
+        "replaces the stored registration config" in record.message
+        for record in caplog.records
+    )
 
 
 def test_abdomen_without_combo_keeps_liver_respiratory():
