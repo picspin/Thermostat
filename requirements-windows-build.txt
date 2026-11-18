@@ -1,0 +1,4 @@
+# Packager pin for the Windows release job.
+# Application dependencies stay in requirements.txt.
+# Do not replace this with a Linux pip freeze; those wheels are not a Windows lockfile.
+pyinstaller==6.22.3

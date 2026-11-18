@@ -39,6 +39,8 @@ MR热统计系统是一个用于磁共振成像（MRI）热图分析的Python应
 - Python 3.7+
 - 操作系统：Windows, macOS 或 Linux
 
+从 GitHub Release 下载的 `MR_Thermometry.exe` 没有代码签名。第一次打开时 Windows SmartScreen 可能提示“Windows 已保护你的电脑”。这是未签名下载文件的系统提示，不是安装失败。
+
 ## 安装步骤
 
 1. **创建并激活Python虚拟环境**（推荐）
