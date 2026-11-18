@@ -305,13 +305,30 @@ class _Box:
 
 
 class _View:
-    def __init__(self, checked):
+    def __init__(self, checked, combo_text="Abdomen"):
         self.coarse_liver_checkbox = _Box(checked)
+        self.registration_site_combo = _Combo(combo_text)
+
+
+class _Combo:
+    def __init__(self, text):
+        self._text = text
+
+    def currentText(self):
+        return self._text
 
 
 def _cinema_controller(checked, config, registrar):
     controller = AdvancedFeaturesController.__new__(AdvancedFeaturesController)
     controller.view = _View(checked)
+    controller.registration_config = config
+    controller.registrar = registrar
+    return controller
+
+
+def _cinema_controller_with_site(checked, config, registrar, body):
+    controller = AdvancedFeaturesController.__new__(AdvancedFeaturesController)
+    controller.view = _View(checked, combo_text=body)
     controller.registration_config = config
     controller.registrar = registrar
     return controller
@@ -348,6 +365,56 @@ def test_cinema_checkbox_on_without_a_config_uses_the_matching_fallback():
     assert historical.mask_kind == "coarse_liver"
     assert historical.metric == "mattes_mi"
     assert historical.transform_kind == "bspline"
+
+
+def test_cinema_head_selects_rigid_preset():
+    stored = RegistrationConfig.liver_respiratory()
+    controller = _cinema_controller_with_site(
+        False, stored, object(), "Head"
+    )
+
+    config = controller._registration_config_for_run()
+
+    assert config.transform_kind == "rigid"
+    assert config.mask_kind == "otsu_dilated"
+    assert config.bspline_grid_spacing_mm is None
+
+
+def test_cinema_joint_selects_rigid_preset():
+    stored = RegistrationConfig.liver_respiratory()
+    controller = _cinema_controller_with_site(
+        False, stored, object(), "Joint"
+    )
+
+    config = controller._registration_config_for_run()
+
+    assert config.transform_kind == "rigid"
+    assert config.mask_kind == "otsu_dilated"
+    assert config.bspline_grid_spacing_mm is None
+
+
+def test_cinema_head_ignores_coarse_liver_checkbox():
+    stored = RegistrationConfig.liver_respiratory()
+    controller = _cinema_controller_with_site(
+        True, stored, object(), "Head"
+    )
+
+    config = controller._registration_config_for_run()
+
+    assert config.mask_kind != "coarse_liver"
+    assert config.transform_kind == "rigid"
+
+
+def test_cinema_joint_ignores_coarse_liver_checkbox():
+    stored = RegistrationConfig.liver_respiratory()
+    controller = _cinema_controller_with_site(
+        True, stored, object(), "Joint"
+    )
+
+    config = controller._registration_config_for_run()
+
+    assert config.mask_kind != "coarse_liver"
+    assert config.transform_kind == "rigid"
 
 
 def _wall_box_phantom():

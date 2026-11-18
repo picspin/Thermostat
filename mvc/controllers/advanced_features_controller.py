@@ -11,6 +11,7 @@ from PyQt5.QtCore import Qt, QTimer
 from mvc.controllers.background_work import BackgroundCall
 from mvc.models.registration import (
     RegistrationConfig,
+    body_part_from_view,
     coarse_liver_requested,
     with_coarse_liver_mask,
 )
@@ -154,25 +155,42 @@ class AdvancedFeaturesController:
             self._close_cinema_progress()
 
     def _registration_config_for_run(self):
-        """Config for this sequence.  Unchecked returns the stored object.
+        """Config for this sequence.
 
-        Checked swaps in the coarse liver mask and leaves the metric and
-        transform alone.  A missing config uses the fallback CinemaModel
-        would have built: the liver preset when this controller also has
-        no registrar, and the historical Mattes B-spline when the caller
-        brought a registrar but no config.  Passing that object in means
-        CinemaModel does not replace it.
+        The body part combo selects the preset.  The coarse liver
+        checkbox is only honored for abdomen.  A missing config uses
+        the fallback CinemaModel would have built: the liver preset
+        when this controller also has no registrar, and the historical
+        Mattes B-spline when the caller brought a registrar but no
+        config.  Passing that object in means CinemaModel does not
+        replace it.
         """
-        enabled = coarse_liver_requested(self.view)
-        if not enabled:
-            return self.registration_config
+        body = body_part_from_view(self.view)
+        requested = coarse_liver_requested(self.view) and body == "abdomen"
+        if not requested:
+            return self._base_for_body_part(body)
         if self.registration_config is not None:
             return with_coarse_liver_mask(self.registration_config, True)
-        if self.registrar is None:
-            fallback = RegistrationConfig.liver_respiratory()
-        else:
-            fallback = RegistrationConfig()
+        fallback = self._body_fallback(body)
         return with_coarse_liver_mask(None, True, fallback=fallback)
+
+    def _base_for_body_part(self, body):
+        """Config for the body part without the coarse liver mask override."""
+        if body == "head":
+            return RegistrationConfig.head()
+        if body == "joint":
+            return RegistrationConfig.joint()
+        return self.registration_config
+
+    def _body_fallback(self, body):
+        """Fallback config for the body part when the stored config is None."""
+        if body == "head":
+            return RegistrationConfig.head()
+        if body == "joint":
+            return RegistrationConfig.joint()
+        if self.registrar is None:
+            return RegistrationConfig.liver_respiratory()
+        return RegistrationConfig()
 
     def _request_cinema_cancel(self):
         """Stop before the next frame.  The current frame is left as it is."""

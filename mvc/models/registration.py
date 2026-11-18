@@ -210,10 +210,76 @@ class RegistrationConfig:
             histogram_bins=32,
         )
 
+    @classmethod
+    def head(cls) -> "RegistrationConfig":
+        """Rigid preset for head motion correction.
+
+        Head motion is predominantly rigid.  No 40 mm respiratory
+        B-spline grid, no coarse liver ROI.  The mask is Otsu plus a
+        12 mm dilation, the same tissue mask the abdomen preset uses.
+        This preset does not select ``mask_kind="coarse_liver"`` and
+        the UI must not allow it even when the checkbox is checked.
+        """
+        return cls(
+            metric="ants_neighborhood_correlation",
+            neighborhood_radius=4,
+            transform_kind="rigid",
+            mask_kind="otsu_dilated",
+            dilation_mm=12.0,
+            histogram_bins=32,
+        )
+
+    @classmethod
+    def joint(cls) -> "RegistrationConfig":
+        """Rigid preset for joint motion correction.
+
+        Joint motion is predominantly rigid.  No respiratory B-spline
+        grid, no coarse liver ROI, no abdominal body-wall hypothesis.
+        Large flexion may fail in a way that the existing rejection
+        logic (failed status, worse MAE, or folded warp) already drops.
+        """
+        return cls(
+            metric="ants_neighborhood_correlation",
+            neighborhood_radius=4,
+            transform_kind="rigid",
+            mask_kind="otsu_dilated",
+            dilation_mm=12.0,
+            histogram_bins=32,
+        )
+
 
 def default_registration_config() -> RegistrationConfig:
-    """Configuration used when the user turns motion correction on."""
+    """Configuration used when the user turns motion correction on.
+
+    The default is the liver respiratory preset (abdomen).
+    Callers that want head or joint pass ``RegistrationConfig.head()``
+    or ``RegistrationConfig.joint()`` explicitly.
+    """
     return RegistrationConfig.liver_respiratory()
+
+
+def body_part_from_view(view) -> str:
+    """Return ``"abdomen"``, ``"head"``, or ``"joint"`` from the view combo.
+
+    The combo defaults to ``"abdomen"``, so a view without one (tests,
+    or any caller that never built it) returns ``"abdomen"`` and
+    keeps the historical ``liver_respiratory()`` path.
+    """
+    combo = getattr(view, "registration_site_combo", None)
+    if combo is None:
+        return "abdomen"
+    # QComboBox.currentText
+    text_cb = getattr(combo, "currentText", None)
+    if not callable(text_cb):
+        return "abdomen"
+    text = str(text_cb())
+    mapping = {"Head": "head", "Joint": "joint"}
+    return mapping.get(text, "abdomen")
+
+
+def coarse_liver_available(body_part: str) -> bool:
+    """The coarse liver ROI is only available for the abdomen."""
+    return body_part == "abdomen"
 
 
 def coarse_liver_requested(view) -> bool:

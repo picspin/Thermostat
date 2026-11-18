@@ -263,3 +263,77 @@ def test_calculate_temperature_without_motion_correction_does_not_register():
 
     assert registrar.calls == []
     assert model.calc_kwargs["use_registration"] is False
+
+
+class _Combo:
+    def __init__(self, text):
+        self._text = text
+
+    def currentText(self):
+        return self._text
+
+
+def test_head_body_part_selects_rigid_preset():
+    controller, _, view, registrar = _controller(_result())
+    controller.registration_config = RegistrationConfig.liver_respiratory()
+    view.coarse_liver_checkbox = _CheckBox(False)
+    view.registration_site_combo = _Combo("Head")
+
+    assert controller.apply_motion_correction() is True
+
+    config = registrar.calls[0]["config"]
+    assert config.transform_kind == "rigid"
+    assert config.mask_kind == "otsu_dilated"
+    assert config.bspline_grid_spacing_mm is None
+
+
+def test_joint_body_part_selects_rigid_preset():
+    controller, _, view, registrar = _controller(_result())
+    controller.registration_config = RegistrationConfig.liver_respiratory()
+    view.coarse_liver_checkbox = _CheckBox(False)
+    view.registration_site_combo = _Combo("Joint")
+
+    assert controller.apply_motion_correction() is True
+
+    config = registrar.calls[0]["config"]
+    assert config.transform_kind == "rigid"
+    assert config.mask_kind == "otsu_dilated"
+    assert config.bspline_grid_spacing_mm is None
+
+
+def test_head_does_not_use_coarse_liver_even_when_checked():
+    controller, _, view, registrar = _controller(_result())
+    controller.registration_config = RegistrationConfig.liver_respiratory()
+    view.coarse_liver_checkbox = _CheckBox(True)
+    view.registration_site_combo = _Combo("Head")
+
+    assert controller.apply_motion_correction() is True
+
+    config = registrar.calls[0]["config"]
+    assert config.mask_kind != "coarse_liver"
+    assert config.transform_kind == "rigid"
+
+
+def test_joint_does_not_use_coarse_liver_even_when_checked():
+    controller, _, view, registrar = _controller(_result())
+    controller.registration_config = RegistrationConfig.liver_respiratory()
+    view.coarse_liver_checkbox = _CheckBox(True)
+    view.registration_site_combo = _Combo("Joint")
+
+    assert controller.apply_motion_correction() is True
+
+    config = registrar.calls[0]["config"]
+    assert config.mask_kind != "coarse_liver"
+    assert config.transform_kind == "rigid"
+
+
+def test_abdomen_without_combo_keeps_liver_respiratory():
+    controller, _, view, registrar = _controller(_result())
+    stored = RegistrationConfig.liver_respiratory()
+    controller.registration_config = stored
+    view.coarse_liver_checkbox = _CheckBox(False)
+
+    assert controller.apply_motion_correction() is True
+
+    assert registrar.calls[0]["config"] is stored
+    assert stored.transform_kind == "rigid_bspline"
