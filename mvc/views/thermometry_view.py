@@ -1,6 +1,6 @@
 from PyQt5.QtWidgets import (
     QMainWindow, QPushButton, QFileDialog, QLabel,
-    QVBoxLayout, QWidget, QCheckBox, QErrorMessage, QLineEdit,
+    QVBoxLayout, QWidget, QCheckBox, QComboBox, QErrorMessage, QLineEdit,
     QHBoxLayout, QSplitter, QTextEdit, QStatusBar, QGroupBox,
     QFormLayout, QDoubleSpinBox, QPushButton, QMenu, QAction, QInputDialog,
     QDialog, QListWidget, QAbstractItemView, QDialogButtonBox,
@@ -15,6 +15,10 @@ from matplotlib.patches import Polygon
 import numpy as np
 import os
 from datetime import datetime
+from mvc.models.registration import (
+    coarse_liver_checkbox_transition,
+    registration_site_from_label,
+)
 
 class ROIManager:
     """Manages ROI drawing and stats calculation."""
@@ -251,8 +255,28 @@ class ThermometryView(QMainWindow):
         )
         options_layout.addWidget(self.motion_correction_checkbox)
 
+        # Body part selection.  Default is "Abdomen" which keeps the existing
+        # liver_respiratory() preset.  Head and Joint switch to rigid-only,
+        # no 40 mm breathing grid, no coarse liver ROI.
+        site_layout = QHBoxLayout()
+        site_layout.addWidget(QLabel("Body part:", self))
+        self.registration_site_combo = QComboBox(self)
+        self.registration_site_combo.addItems(["Abdomen", "Head", "Joint"])
+        self.registration_site_combo.setToolTip(
+            'Abdomen: rigid + 40 mm B-spline (liver respiratory). '
+            'Head / Joint: rigid only, no coarse liver ROI. '
+            'Default is Abdomen.'
+        )
+        self.registration_site_combo.currentTextChanged.connect(
+            self._on_registration_site_changed
+        )
+        site_layout.addWidget(self.registration_site_combo)
+        site_layout.addStretch()
+        options_layout.addLayout(site_layout)
+
         # Off by default.  Motion correction keeps the Otsu tissue mask
         # until this is checked; checking it alone does not register.
+        # Only available when the body part is Abdomen.
         self.coarse_liver_checkbox = QCheckBox('Use coarse liver ROI', self)
         self.coarse_liver_checkbox.setToolTip(
             'Off by default. When motion correction is also on, the metric '
@@ -260,9 +284,12 @@ class ThermometryView(QMainWindow):
             'tissue above the corner air estimate, with about 20 mm of body '
             'wall removed. The ROI is taken from the magnitude image, not '
             'the real component. This is not a liver segmentation. It does '
-            'nothing unless motion correction is checked.'
+            'nothing unless motion correction is checked. '
+            'Only available for Abdomen body part.'
         )
         options_layout.addWidget(self.coarse_liver_checkbox)
+        # Abdomen check state saved while Head or Joint is selected.
+        self._coarse_liver_for_abdomen = None
         
         options_group.setLayout(options_layout)
         left_layout.addWidget(options_group)
@@ -433,6 +460,22 @@ class ThermometryView(QMainWindow):
     def on_reset(self):
         self.reset_signal.emit()
         self.reset_ui()
+
+    def _on_registration_site_changed(self, text):
+        """Enable the coarse liver checkbox only for the abdomen site.
+
+        Leaving abdomen remembers the check.  Coming back restores it,
+        including a switch Head -> Joint -> Abdomen.
+        """
+        site = registration_site_from_label(text)
+        checked, enabled, remembered = coarse_liver_checkbox_transition(
+            site,
+            self.coarse_liver_checkbox.isChecked(),
+            self._coarse_liver_for_abdomen,
+        )
+        self._coarse_liver_for_abdomen = remembered
+        self.coarse_liver_checkbox.setEnabled(enabled)
+        self.coarse_liver_checkbox.setChecked(checked)
         
     def on_save_temperature_map(self):
         file, _ = QFileDialog.getSaveFileName(self, "Save Temperature Map", "", "JPEG Files (*.jpg);;PNG Files (*.png)")
@@ -691,7 +734,13 @@ class ThermometryView(QMainWindow):
         self.gaussian_filter_checkbox.setChecked(False)
         self.b0_correction_checkbox.setChecked(False)
         self.motion_correction_checkbox.setChecked(False)
+        # Drop any remembered abdomen check before the combo signal runs.
+        self._coarse_liver_for_abdomen = None
+        self.coarse_liver_checkbox.setEnabled(True)
         self.coarse_liver_checkbox.setChecked(False)
+        self.registration_site_combo.blockSignals(True)
+        self.registration_site_combo.setCurrentIndex(0)  # Abdomen
+        self.registration_site_combo.blockSignals(False)
         self.dicom_info.clear()
         self.roi_results.clear()
         self.temperature_map = None

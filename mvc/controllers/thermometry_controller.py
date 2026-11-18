@@ -5,7 +5,10 @@ from PyQt5.QtWidgets import QApplication, QProgressDialog, QWidget
 from mvc.controllers.background_work import BackgroundCall
 from mvc.models.registration import (
     SimpleITKRegistrar,
+    body_part_from_view,
+    coarse_liver_available,
     coarse_liver_requested,
+    config_for_body_part,
     default_registration_config,
     with_coarse_liver_mask,
 )
@@ -263,15 +266,15 @@ class ThermometryController:
     def _registration_config_for_run(self):
         """Config for this correction.  The stored preset is not mutated.
 
-        The coarse liver checkbox replaces only ``mask_kind``.  The metric
-        and the transform stay on the injected config.  A view without the
-        checkbox, which is how the tests build one, keeps that config
-        object.
+        The body part combo picks the preset: abdomen stays on the
+        stored config (default liver_respiratory), head and joint
+        select rigid-only.  The coarse liver checkbox is only honored
+        for abdomen.
         """
-        return with_coarse_liver_mask(
-            self.registration_config,
-            coarse_liver_requested(self.view),
-        )
+        body = body_part_from_view(self.view)
+        requested = coarse_liver_requested(self.view) and coarse_liver_available(body)
+        base = config_for_body_part(self.registration_config, body)
+        return with_coarse_liver_mask(base, requested)
 
     def calculate_temperature(self, original_temperature, apply_gaussian, apply_b0_correction, apply_motion_correction):
         """Handle temperature calculation request.

@@ -19,6 +19,7 @@ correction itself is on.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Optional, Tuple
@@ -210,10 +211,144 @@ class RegistrationConfig:
             histogram_bins=32,
         )
 
+    @classmethod
+    def _rigid_site(cls) -> "RegistrationConfig":
+        """Rigid parameters shared by the head and joint presets.
+
+        No 40 mm respiratory grid and no coarse liver mask.  The mask
+        is the existing Otsu dilation.  ``liver_wall_mm`` stays at the
+        dataclass default and is not applied: that field is only read
+        when ``mask_kind`` is ``"coarse_liver"``.
+        """
+        return cls(
+            metric="ants_neighborhood_correlation",
+            neighborhood_radius=4,
+            transform_kind="rigid",
+            mask_kind="otsu_dilated",
+            dilation_mm=12.0,
+            histogram_bins=32,
+        )
+
+    @classmethod
+    def head(cls) -> "RegistrationConfig":
+        """Rigid preset for head motion correction.
+
+        Head motion is predominantly rigid, so this is an Euler
+        transform rather than the abdominal respiratory grid.  It does
+        not select ``mask_kind="coarse_liver"``.  The config is identical
+        to ``joint()``; there is no separate site field.
+        """
+        return cls._rigid_site()
+
+    @classmethod
+    def joint(cls) -> "RegistrationConfig":
+        """Rigid preset for joint motion correction.
+
+        Same rigid parameters as ``head()``.  ``liver_wall_mm`` remains
+        the dataclass default and is ignored: this preset does not use
+        the coarse liver mask or an abdominal wall thickness.  Large
+        flexion may fail.  A failed registration, a warp that increases
+        the error, or a folded warp is dropped by the existing frame
+        logic; the previous frame is not reused.
+        """
+        return cls._rigid_site()
+
 
 def default_registration_config() -> RegistrationConfig:
-    """Configuration used when the user turns motion correction on."""
+    """Configuration used when the user turns motion correction on.
+
+    The default is the liver respiratory preset (abdomen).
+    Callers that want head or joint pass ``RegistrationConfig.head()``
+    or ``RegistrationConfig.joint()`` explicitly.
+    """
     return RegistrationConfig.liver_respiratory()
+
+
+_SITE_LABELS = {
+    "Abdomen": "abdomen",
+    "Head": "head",
+    "Joint": "joint",
+}
+
+
+def registration_site_from_label(text) -> str:
+    """Map a combo label to ``abdomen``, ``head``, or ``joint``.
+
+    An unknown label is an error.  A missing combo is handled by
+    ``body_part_from_view``, which still defaults to abdomen.
+    """
+    key = str(text)
+    if key not in _SITE_LABELS:
+        known = ", ".join(_SITE_LABELS)
+        raise ValueError(
+            f"Unknown registration site {text!r}. Expected one of: {known}."
+        )
+    return _SITE_LABELS[key]
+
+
+def body_part_from_view(view) -> str:
+    """Return ``"abdomen"``, ``"head"``, or ``"joint"`` from the view combo.
+
+    The combo defaults to abdomen, so a view without one (tests, or any
+    caller that never built it) returns ``"abdomen"`` and keeps the
+    historical ``liver_respiratory()`` path.  A combo that returns an
+    unknown label raises ``ValueError`` instead of silently running the
+    abdominal preset.
+    """
+    combo = getattr(view, "registration_site_combo", None)
+    if combo is None:
+        return "abdomen"
+    text_cb = getattr(combo, "currentText", None)
+    if not callable(text_cb):
+        return "abdomen"
+    return registration_site_from_label(text_cb())
+
+
+def coarse_liver_available(body_part: str) -> bool:
+    """The coarse liver ROI is only available for the abdomen."""
+    return body_part == "abdomen"
+
+
+def coarse_liver_checkbox_transition(site, checked, remembered):
+    """Next coarse-liver checkbox state after the site changes.
+
+    ``remembered`` is the abdomen check state saved while the site is
+    head or joint, or ``None`` while the site is abdomen.  Leaving
+    abdomen stores ``checked`` and clears the box.  Switching between
+    head and joint keeps that memory.  Returning to abdomen restores it.
+
+    Returns ``(checked, enabled, remembered)``.
+    """
+    if coarse_liver_available(site):
+        if remembered is not None:
+            checked = bool(remembered)
+            remembered = None
+        return bool(checked), True, remembered
+    if remembered is None:
+        remembered = bool(checked)
+    return False, False, remembered
+
+
+def config_for_body_part(stored, body):
+    """Config for ``body``.  Abdomen keeps ``stored`` unchanged.
+
+    Head and joint return that rigid preset.  Replacing a different
+    stored config is logged, because an injected metric is not used
+    for those sites.  ``stored is None`` is not an override.
+    """
+    if body == "head":
+        preset = RegistrationConfig.head()
+    elif body == "joint":
+        preset = RegistrationConfig.joint()
+    else:
+        return stored
+    if stored is not None and stored != preset:
+        logging.getLogger(__name__).info(
+            "Registration site %s replaces the stored registration config "
+            "with the rigid preset. The stored metric and transform are not used.",
+            body,
+        )
+    return preset
 
 
 def coarse_liver_requested(view) -> bool:

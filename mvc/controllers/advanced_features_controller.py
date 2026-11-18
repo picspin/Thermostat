@@ -11,7 +11,10 @@ from PyQt5.QtCore import Qt, QTimer
 from mvc.controllers.background_work import BackgroundCall
 from mvc.models.registration import (
     RegistrationConfig,
+    body_part_from_view,
+    coarse_liver_available,
     coarse_liver_requested,
+    config_for_body_part,
     with_coarse_liver_mask,
 )
 from mvc.models.thermal_dose import (
@@ -154,25 +157,42 @@ class AdvancedFeaturesController:
             self._close_cinema_progress()
 
     def _registration_config_for_run(self):
-        """Config for this sequence.  Unchecked returns the stored object.
+        """Config for this sequence.
 
-        Checked swaps in the coarse liver mask and leaves the metric and
-        transform alone.  A missing config uses the fallback CinemaModel
-        would have built: the liver preset when this controller also has
-        no registrar, and the historical Mattes B-spline when the caller
-        brought a registrar but no config.  Passing that object in means
-        CinemaModel does not replace it.
+        The body part combo selects the preset.  The coarse liver
+        checkbox is only honored for abdomen.  A missing config uses
+        the fallback CinemaModel would have built: the liver preset
+        when this controller also has no registrar, and the historical
+        Mattes B-spline when the caller brought a registrar but no
+        config.  Passing that object in means CinemaModel does not
+        replace it.
         """
-        enabled = coarse_liver_requested(self.view)
-        if not enabled:
-            return self.registration_config
+        body = body_part_from_view(self.view)
+        requested = (
+            coarse_liver_requested(self.view) and coarse_liver_available(body)
+        )
+        if not requested:
+            return config_for_body_part(self.registration_config, body)
         if self.registration_config is not None:
             return with_coarse_liver_mask(self.registration_config, True)
+        # ``requested`` is true only when the site is abdomen, so a
+        # missing config uses the abdomen fallback.  Head and joint
+        # return above, from ``config_for_body_part``.
+        return with_coarse_liver_mask(
+            None, True, fallback=self._abdomen_fallback()
+        )
+
+    def _abdomen_fallback(self):
+        """Abdomen config used when the coarse liver mask was requested
+        and nothing was stored.
+
+        No registrar means the liver preset.  A registrar without a
+        config means the historical Mattes B-spline, which is what
+        ``CinemaModel`` would have used.
+        """
         if self.registrar is None:
-            fallback = RegistrationConfig.liver_respiratory()
-        else:
-            fallback = RegistrationConfig()
-        return with_coarse_liver_mask(None, True, fallback=fallback)
+            return RegistrationConfig.liver_respiratory()
+        return RegistrationConfig()
 
     def _request_cinema_cancel(self):
         """Stop before the next frame.  The current frame is left as it is."""

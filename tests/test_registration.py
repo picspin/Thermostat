@@ -1,5 +1,7 @@
 """Tests for the pure registration module."""
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 import SimpleITK as sitk
@@ -25,6 +27,9 @@ from mvc.models.registration import (
     _magnitude_max,
     _magnitude_rms,
     _ncc,
+    body_part_from_view,
+    coarse_liver_available,
+    coarse_liver_checkbox_transition,
     default_registration_config,
 )
 
@@ -355,6 +360,90 @@ def test_liver_preset_is_the_checkbox_configuration():
     assert RegistrationConfig().metric == "mattes_mi"
     assert RegistrationConfig().mask_kind == "none"
     assert RegistrationConfig().liver_wall_mm == 20.0
+
+
+def test_head_preset_is_rigid_with_no_bspline_grid():
+    config = RegistrationConfig.head()
+
+    assert config.transform_kind == "rigid"
+    assert config.metric == "ants_neighborhood_correlation"
+    assert config.mask_kind == "otsu_dilated"
+    assert config.dilation_mm == 12.0
+    assert config.bspline_grid_spacing_mm is None
+    assert config.mask_kind != "coarse_liver"
+
+
+def test_joint_preset_is_rigid_with_no_bspline_grid():
+    config = RegistrationConfig.joint()
+
+    assert config.transform_kind == "rigid"
+    assert config.metric == "ants_neighborhood_correlation"
+    assert config.mask_kind == "otsu_dilated"
+    assert config.dilation_mm == 12.0
+    assert config.bspline_grid_spacing_mm is None
+    assert config.mask_kind != "coarse_liver"
+
+
+def test_head_preset_reduces_rigid_error():
+    fixed = _phantom((40, 40))
+    moving = _resample_euler(fixed, translation=(4.0, -3.0))
+    before = _mae(fixed, moving)
+
+    result = SimpleITKRegistrar().register_complex(
+        fixed, None, moving, None,
+        replace(RegistrationConfig.head(), random_seed=1234),
+        spacing_mm=(1.0, 1.0),
+    )
+
+    assert result.succeeded
+    assert _mae(fixed, result.warped_real) < before
+    assert result.config.mask_kind == "otsu_dilated"
+    assert result.config.transform_kind == "rigid"
+
+
+def test_joint_preset_reduces_rigid_error():
+    fixed = _phantom((40, 40))
+    moving = _resample_euler(fixed, translation=(3.0, 2.0))
+    before = _mae(fixed, moving)
+
+    result = SimpleITKRegistrar().register_complex(
+        fixed, None, moving, None,
+        replace(RegistrationConfig.joint(), random_seed=1234),
+        spacing_mm=(1.0, 1.0),
+    )
+
+    assert result.succeeded
+    assert _mae(fixed, result.warped_real) < before
+    assert result.config.mask_kind == "otsu_dilated"
+    assert result.config.transform_kind == "rigid"
+
+
+@pytest.mark.parametrize(
+    "preset",
+    [RegistrationConfig.head, RegistrationConfig.joint],
+    ids=["head", "joint"],
+)
+def test_rigid_site_presets_reduce_a_known_rotation(preset):
+    fixed = _phantom()
+    moving = _resample_euler(fixed, angle_deg=10.0)
+    before = _mae(fixed, moving)
+
+    result = SimpleITKRegistrar().register_complex(
+        fixed,
+        None,
+        moving,
+        None,
+        replace(preset(), random_seed=1234),
+        spacing_mm=(1.0, 1.0),
+    )
+
+    assert result.succeeded
+    assert "Euler2D" in result.transform.GetName()
+    assert result.config.mask_kind != "coarse_liver"
+    assert result.config.bspline_grid_spacing_mm is None
+    recovered = np.degrees(result.transform.GetAngle())
+    assert recovered == pytest.approx(-10.0, abs=1.5)
+    assert _mae(fixed, result.warped_real) < before
 
 
 def test_otsu_mask_drops_distant_air_and_dilates():
@@ -1285,3 +1374,85 @@ def test_mind_accepts_a_singleton_axis():
     assert result.succeeded
     assert result.metric_name == "MIND"
     assert np.isfinite(result.final_metric)
+
+
+# ── body part helpers ──────────────────────────────────────────────
+
+
+def test_body_part_from_view_defaults_to_abdomen():
+    view = object()
+    assert body_part_from_view(view) == "abdomen"
+
+
+def test_body_part_from_view_without_combo_is_abdomen():
+    view = type("V", (), {})()
+    assert body_part_from_view(view) == "abdomen"
+
+
+def test_body_part_from_view_recognises_head():
+    class Combo:
+        def currentText(self):
+            return "Head"
+
+    view = type("V", (), {"registration_site_combo": Combo()})()
+    assert body_part_from_view(view) == "head"
+
+
+def test_body_part_from_view_recognises_joint():
+    class Combo:
+        def currentText(self):
+            return "Joint"
+
+    view = type("V", (), {"registration_site_combo": Combo()})()
+    assert body_part_from_view(view) == "joint"
+
+
+def test_body_part_from_view_recognises_abdomen():
+    class Combo:
+        def currentText(self):
+            return "Abdomen"
+
+    view = type("V", (), {"registration_site_combo": Combo()})()
+    assert body_part_from_view(view) == "abdomen"
+
+
+def test_coarse_liver_is_only_available_for_abdomen():
+    assert coarse_liver_available("abdomen") is True
+    assert coarse_liver_available("head") is False
+    assert coarse_liver_available("joint") is False
+
+
+def test_head_and_joint_share_one_rigid_preset():
+    head = RegistrationConfig.head()
+    joint = RegistrationConfig.joint()
+
+    assert head == joint
+    assert head.liver_wall_mm == RegistrationConfig().liver_wall_mm
+    assert head.mask_kind != "coarse_liver"
+
+
+def test_unknown_registration_site_is_rejected():
+    class Combo:
+        def currentText(self):
+            return "Pelvis"
+
+    view = type("V", (), {"registration_site_combo": Combo()})()
+    with pytest.raises(ValueError, match="Unknown registration site"):
+        body_part_from_view(view)
+
+
+def test_coarse_liver_check_is_restored_on_return_to_abdomen():
+    checked, enabled, remembered = coarse_liver_checkbox_transition(
+        "head", True, None
+    )
+    assert (checked, enabled, remembered) == (False, False, True)
+
+    checked, enabled, remembered = coarse_liver_checkbox_transition(
+        "joint", False, remembered
+    )
+    assert (checked, enabled, remembered) == (False, False, True)
+
+    checked, enabled, remembered = coarse_liver_checkbox_transition(
+        "abdomen", False, remembered
+    )
+    assert (checked, enabled, remembered) == (True, True, None)
