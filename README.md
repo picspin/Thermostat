@@ -106,6 +106,8 @@ Cinema 序列完成后会另外计算 CEM43。计算在 `mvc/models/thermal_dose
 
 推送和拉取请求会运行 `.github/workflows/tests.yml`：安装依赖、`compileall` 和 `pytest`。它不启动图形界面。
 
+`.github/workflows/windows-build.yml` 在 GitHub 托管的 `windows-latest` 上，用 `requirements-windows.txt` 里钉死的依赖（含 PyInstaller 6.22.3、PyQt5、SimpleITK）把 `run.py` 打成 zip。拉取请求和 `main` 只上传 artifact。只有形如 `vX.Y.Z` 的 tag，并且构建成功时，才用 `GITHUB_TOKEN` 发布 Release。发布说明里的版本来自这个 tag，并固定写明没有监管认证、不能当成治疗终点。`MR_Thermometry.exe` 没有代码签名，第一次运行时 Windows SmartScreen 可能拦截。构建后的启动检查只确认进程没有马上退出，不是在 Windows 上用临床数据做的手工界面验收。`install_and_run.bat` 仍然只是给开发者创建虚拟环境并执行 `python run.py`，不是这个安装包。
+
 ## 许可证
 
 本项目采用[MIT许可证](LICENSE)。

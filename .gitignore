@@ -3,8 +3,8 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# Windows build artifacts — never commit exe, zip, build or dist
+# Windows build artifacts — never commit the exe, the package zip, or PyInstaller output
 dist/
 build/
 *.spec
-*.zip
+/MR_Thermometry-windows.zip
