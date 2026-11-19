@@ -70,26 +70,35 @@ MR热统计系统是一个用于磁共振成像（MRI）热图分析的Python应
 
 ## 使用说明
 
-### 批量加载DICOM文件
-1. 点击"Batch Load DICOM Files"按钮
-2. 选择实部、虚部和B0图像文件（可多选）
-3. 程序会自动识别并加载文件
+界面文字是英文。下面用的是窗口上的原标签。
+
+### 批量加载 DICOM 文件夹
+1. 打开菜单 **Batch → Load Folders**。主窗口没有名为 “Batch Load DICOM Files” 的按钮。
+2. 在标题为 “Select DICOM Folders” 的窗口里点 **Add Folder**，加入含 `.dcm` 文件的文件夹。可以加多个文件夹，按住 Ctrl 多选后点 **OK**。程序会递归扫描，不在这里直接多选单个文件。
+3. 只认扩展名为 `.dcm` 的文件。实部、虚部靠 Image Type 或标签 (0008,9208) 里的 REAL / IMAGINARY，认不出时再看文件名里的 REAL / IMAG。B0 图靠 Series Description 或文件名里的 B0、FIELD、MAP。
+4. 至少两对实部和虚部才会装入 “Load 1st Real DICOM” 到 “Load 2nd Imaginary DICOM” 对应的数据。更多时相留给 Cinema。计算还需要 DICOM 里的 Echo Time 和 Magnetic Field Strength。
 
 ### 计算温度图
-1. 设置基准温度（通常为37°C）
-2. 选择处理选项（高斯滤波、B0校正、运动校正）
-3. 点击"Calculate Temperature Change"按钮
+1. **Baseline Temperature (°C)** 默认是 37.0。
+2. 按需要勾选 **Apply Gaussian Filter**、**Apply B0 Correction**、**Apply Motion Correction**。运动校正的部位用 **Body part:**，选项是 Abdomen、Head、Joint，默认 Abdomen。**Use coarse liver ROI** 默认不勾，而且只在腹部并同时勾选运动校正时才参与配准。
+3. 点 **Calculate Temperature Change**。
 
-### ROI分析
-1. 右键并拖动以绘制ROI
-2. ROI统计数据将显示在左侧面板
-3. 可使用"Save ROI Mask"保存ROI
-4. 可使用"Load ROI Mask"加载之前保存的ROI
+### ROI 分析
+1. 在温度图上右键拖动绘制 ROI。左侧说明是 “Right-click and drag to draw ROI”。
+2. 统计出现在 “ROI Analysis” 里，格式是 Average、Min、Max 和 Pixels。
+3. 保存和加载 ROI 掩膜在菜单 **Tools → ROI Management** 的 **Save ROI Mask** 和 **Load ROI Mask**，不是主窗口按钮。主窗口上的 **Save ROI Stats** 只保存统计数字。
 
-### 窗宽窗位调整
-1. 使用"Window Center"控制显示的中心温度
-2. 使用"Window Width"控制显示的温度范围
-3. 点击"Auto Window"自动优化窗宽窗位
+### 窗宽窗位
+1. **Window Center (°C)** 是显示中心。
+2. **Window Width (°C)** 是显示范围。
+3. 点 **Auto Window** 按当前温度图调整。
+
+### Cinema 和 CEM43
+1. 先用 **Batch → Load Folders** 装入至少三个时相。只算一张温度图时，**Generate Cinema** 会提示先做批量文件夹加载。
+2. 点 **Generate Cinema**，或用菜单 **Batch → Cinema**。播放窗口标题是 “Temperature Map Cinema”，按钮是 Play、Stop、Save Video。
+3. 未勾选 **Apply Motion Correction** 时会弹出 “CEM43 thermal dose”，说明不显示 CEM43，因为这时每帧是相邻温差加基线。勾选运动校正后，每一帧相对第一帧，配准被接受的帧才会进入 “CEM43 thermal dose” 窗口。配准使误差变大或折叠的帧会被丢掉，不会用上一帧填上。
+4. 剂量窗口里的 **39°C reference line**、**CEM43 = 2 reference line**、**CEM43 = 9 reference line** 默认不勾。说明文字写明这是 van Rhoon 等 Eur Radiol 2013 的射频安全参考，不是治疗完成。主窗口上先画好 ROI，再点 **Update ROI curves** 更新曲线。
+5. **Generate Thermostat** 需要已经算完的 Cinema 序列和主窗口上的 ROI，窗口标题是 “ROI Temperature-Time Curve”。
 
 ## 开发与测试
 
