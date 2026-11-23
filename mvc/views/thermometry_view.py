@@ -158,8 +158,10 @@ class ThermometryView(QMainWindow):
         self.setStatusBar(self.statusBar)
         self.cursor_label = QLabel("Position: N/A")
         self.value_label = QLabel("Value: N/A")
+        self.frame_count_label = QLabel("Sequence: not loaded")
         self.statusBar.addPermanentWidget(self.cursor_label)
         self.statusBar.addPermanentWidget(self.value_label)
+        self.statusBar.addPermanentWidget(self.frame_count_label)
         
         # --- Central Widget and Main Splitter ---
         central_widget = QWidget(self)
@@ -170,9 +172,15 @@ class ThermometryView(QMainWindow):
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         
-        # DICOM Loading Group - 移除Batch Load按钮，只保留单独加载按钮
-        dicom_group = QGroupBox("DICOM Loading")
+        # Two-frame temperature still uses the four single-file loads.
+        dicom_group = QGroupBox("Two-frame temperature")
         dicom_layout = QVBoxLayout()
+        two_frame_hint = QLabel(
+            "Next: load the four DICOMs below, set options, then "
+            "Calculate Temperature Change."
+        )
+        two_frame_hint.setWordWrap(True)
+        dicom_layout.addWidget(two_frame_hint)
         
         # 保留原有的单独加载按钮（为了向后兼容性）
         load_real1_layout = QHBoxLayout()
@@ -294,10 +302,49 @@ class ThermometryView(QMainWindow):
         options_group.setLayout(options_layout)
         left_layout.addWidget(options_group)
         
-        # Calculation Button
+        # Calculation Button — next step after the four single-file loads
         self.calc_button = QPushButton('Calculate Temperature Change', self)
+        self.calc_button.setToolTip(
+            'Two-frame temperature from the four DICOM loads above.'
+        )
         self.calc_button.clicked.connect(self.on_calculate)
         left_layout.addWidget(self.calc_button)
+
+        # Sequence path.  Cinema, CEM43, and the ROI curve start here,
+        # not only from the Batch menu.
+        sequence_group = QGroupBox("Sequence")
+        sequence_layout = QVBoxLayout()
+        self.sequence_next_label = QLabel(
+            "Next: Load DICOM Sequence, then Generate Cinema."
+        )
+        self.sequence_next_label.setWordWrap(True)
+        sequence_layout.addWidget(self.sequence_next_label)
+
+        self.load_sequence_button = QPushButton('Load DICOM Sequence', self)
+        self.load_sequence_button.setToolTip(
+            'Select folders of real / imaginary DICOM frames for Cinema, '
+            'CEM43, and the ROI temperature curve. Same loader as '
+            'Batch → Load Folders.'
+        )
+        self.load_sequence_button.clicked.connect(self.on_batch_load_folders)
+        sequence_layout.addWidget(self.load_sequence_button)
+
+        self.cinema_button = QPushButton('Generate Cinema', self)
+        self.cinema_button.setToolTip(
+            'Play back the loaded temperature sequence. CEM43 is shown '
+            'afterwards only when Apply Motion Correction is checked.'
+        )
+        sequence_layout.addWidget(self.cinema_button)
+
+        self.thermostat_button = QPushButton('Generate Thermostat', self)
+        self.thermostat_button.setToolTip(
+            'ROI temperature–time curve for the current ROI across the '
+            'Cinema sequence. Draw the ROI on the main window first.'
+        )
+        sequence_layout.addWidget(self.thermostat_button)
+
+        sequence_group.setLayout(sequence_layout)
+        left_layout.addWidget(sequence_group)
         
         # ROI Group
         roi_group = QGroupBox("ROI Analysis")
@@ -342,21 +389,6 @@ class ThermometryView(QMainWindow):
         
         actions_group.setLayout(actions_layout)
         left_layout.addWidget(actions_group)
-        
-        # Add Cinema and Thermostat buttons
-        advanced_group = QGroupBox("Advanced Features")
-        advanced_layout = QVBoxLayout()
-
-        self.cinema_button = QPushButton('Generate Cinema', self)
-        self.cinema_button.setToolTip('Generate temperature map sequence movie')
-        advanced_layout.addWidget(self.cinema_button)
-
-        self.thermostat_button = QPushButton('Generate Thermostat', self)
-        self.thermostat_button.setToolTip('Generate time-temperature curve for ROI')
-        advanced_layout.addWidget(self.thermostat_button)
-
-        advanced_group.setLayout(advanced_layout)
-        left_layout.addWidget(advanced_group)
 
         # Add stretch to push everything up
         left_layout.addStretch()
@@ -611,6 +643,51 @@ class ThermometryView(QMainWindow):
             self.roi_results.setText(text)
         else:
             self.roi_results.clear()
+
+    def set_frame_counts(self, real_count, imag_count, b0_count=0):
+        """Keep real/imag frame counts in the status bar after a sequence load.
+
+        Counts stay visible after the transient status message times out.
+        A kind with no frames is named in ``missing``, so Cinema can be
+        started only after the user can see which half of the pair is absent.
+        B0 is optional and is listed only when a map was found.
+        """
+        real_count = int(real_count)
+        imag_count = int(imag_count)
+        b0_count = int(b0_count)
+        parts = [f"{real_count} real", f"{imag_count} imag"]
+        if b0_count > 0:
+            parts.append(f"{b0_count} B0")
+        missing = []
+        if real_count <= 0:
+            missing.append("real")
+        if imag_count <= 0:
+            missing.append("imag")
+        text = ", ".join(parts)
+        if missing:
+            text += " (missing: " + ", ".join(missing) + ")"
+        self.frame_count_label.setText(f"Sequence: {text}")
+        next_label = getattr(self, "sequence_next_label", None)
+        if next_label is None:
+            return
+        if missing:
+            named = " and ".join(missing)
+            next_label.setText(
+                f"Sequence loaded, but {named} frames are missing. "
+                "Generate Cinema needs both real and imaginary frames."
+            )
+        elif real_count < 2 or imag_count < 2:
+            next_label.setText(
+                "Sequence loaded. Next: Load DICOM Sequence with at least "
+                "2 real and 2 imaginary frames, then Generate Cinema."
+            )
+        else:
+            next_label.setText(
+                "Next: Generate Cinema. CEM43 is shown only if Apply Motion "
+                "Correction is checked; otherwise that window explains why "
+                "and does not show a dose. Then draw an ROI and Generate "
+                "Thermostat for the temperature curve."
+            )
         
     def update_status(self, message, timeout_ms=5000):
         """Update the status bar with a message.
@@ -658,16 +735,23 @@ class ThermometryView(QMainWindow):
         load_imag2_action.triggered.connect(self.on_load_imag2)
         load_b0_action = QAction('Load B0 Map DICOM', self)
         load_b0_action.triggered.connect(self.on_load_b0_map)
+        load_sequence_action = QAction('Load DICOM Sequence', self)
+        load_sequence_action.triggered.connect(self.on_batch_load_folders)
         
         load_menu.addAction(load_real1_action)
         load_menu.addAction(load_imag1_action)
         load_menu.addAction(load_real2_action)
         load_menu.addAction(load_imag2_action)
         load_menu.addAction(load_b0_action)
+        load_menu.addSeparator()
+        load_menu.addAction(load_sequence_action)
         
         # 创建独立的Batch菜单
         batch_menu = menubar.addMenu('Batch')
         load_folders_action = QAction('Load Folders', self)
+        load_folders_action.setToolTip(
+            'Same as Load DICOM Sequence on the main window.'
+        )
         load_folders_action.triggered.connect(self.on_batch_load_folders)
         batch_menu.addAction(load_folders_action)
         
@@ -763,7 +847,8 @@ class ThermometryView(QMainWindow):
             # 手动重置ROI管理器
             self.roi_manager = ROIManager(self)
         
-        # Clear cursor info
+        # Clear cursor info.  The sequence frame counts stay: Reset All
+        # clears the two-frame images, not the loaded sequence paths.
         self.cursor_label.setText("Position: N/A")
         self.value_label.setText("Value: N/A")
         
@@ -843,13 +928,28 @@ class ThermometryView(QMainWindow):
 
     def on_cinema(self):
         """生成温度图变化电影。"""
-        # 检查是否有足够的数据
-        if not hasattr(self, 'all_real_files') or not hasattr(self, 'all_imag_files'):
-            self.show_error("No sequence data available. Please use 'Batch Load Folders' first.")
+        if not self._sequence_ready_for_cinema():
             return
             
         # 发送信号到控制器
         self.generate_cinema_signal.emit()
+
+    def _sequence_ready_for_cinema(self):
+        """Report a missing sequence, naming the kind that was not loaded."""
+        real_files = getattr(self, "all_real_files", None) or []
+        imag_files = getattr(self, "all_imag_files", None) or []
+        if real_files and imag_files:
+            return True
+        missing = []
+        if not real_files:
+            missing.append("real")
+        if not imag_files:
+            missing.append("imag")
+        self.show_error(
+            "No sequence data available. Please use 'Load DICOM Sequence' first. "
+            "Missing: " + ", ".join(missing) + "."
+        )
+        return False
         
     def on_thermostat(self):
         """生成ROI温度-时间曲线。"""
