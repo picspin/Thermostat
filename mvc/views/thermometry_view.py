@@ -885,6 +885,12 @@ class ThermometryView(QMainWindow):
             
     def on_batch_load_folders(self):
         """使用自定义对话框批量加载多个文件夹"""
+        if getattr(self, "sequence_busy", False):
+            self.show_error(
+                "A temperature sequence is already running. "
+                "Wait for it to finish or cancel it before loading another sequence."
+            )
+            return
         dialog = FolderSelectionDialog(self)
         if dialog.exec_() == QDialog.Accepted:
             selected_folders = dialog.get_selected_folders()
@@ -938,18 +944,24 @@ class ThermometryView(QMainWindow):
         """Report a missing sequence, naming the kind that was not loaded."""
         real_files = getattr(self, "all_real_files", None) or []
         imag_files = getattr(self, "all_imag_files", None) or []
-        if real_files and imag_files:
-            return True
-        missing = []
-        if not real_files:
-            missing.append("real")
-        if not imag_files:
-            missing.append("imag")
-        self.show_error(
-            "No sequence data available. Please use 'Load DICOM Sequence' first. "
-            "Missing: " + ", ".join(missing) + "."
-        )
-        return False
+        if not real_files or not imag_files:
+            missing = []
+            if not real_files:
+                missing.append("real")
+            if not imag_files:
+                missing.append("imag")
+            self.show_error(
+                "No sequence data available. Please use 'Load DICOM Sequence' first. "
+                "Missing: " + ", ".join(missing) + "."
+            )
+            return False
+        if len(real_files) < 2 or len(imag_files) < 2:
+            self.show_error(
+                "Need at least 2 real and 2 imaginary files for Cinema feature. "
+                f"Have {len(real_files)} real and {len(imag_files)} imaginary."
+            )
+            return False
+        return True
         
     def on_thermostat(self):
         """生成ROI温度-时间曲线。"""

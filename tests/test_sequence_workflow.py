@@ -133,6 +133,11 @@ def test_cinema_without_a_sequence_names_the_missing_kind():
     assert view._sequence_ready_for_cinema() is False
     assert "Missing: real, imag" in view.errors[-1]
 
+    view.all_real_files = ["r1.dcm"]
+    view.all_imag_files = ["i1.dcm"]
+    assert view._sequence_ready_for_cinema() is False
+    assert "Have 1 real and 1 imaginary" in view.errors[-1]
+
 
 def test_batch_load_reports_missing_imaginary_frames(tmp_path):
     _write_dicom(Path(tmp_path) / "phase1_REAL.dcm")
@@ -146,7 +151,8 @@ def test_batch_load_reports_missing_imaginary_frames(tmp_path):
 
     assert view.errors == []
     assert view.frame_counts == (2, 0, 0)
-    assert any("missing: imaginary" in message for message in view.statuses)
+    assert any("missing: imag" in message for message in view.statuses)
+    assert not any("missing: imaginary" in message for message in view.statuses)
 
 
 def test_batch_load_reports_both_kinds(tmp_path):
@@ -277,6 +283,7 @@ class _Widget:
         self.modal = None
         self.visible = False
         self.closed = False
+        self.deleted = False
         self.signals_blocked = False
         self.clicked = _Signal()
         self.rejected = _Signal()
@@ -330,6 +337,9 @@ class _Widget:
         if not self.signals_blocked:
             for slot in list(self.finished.slots):
                 slot()
+
+    def deleteLater(self):
+        self.deleted = True
 
 
 class _Axes:
@@ -452,8 +462,81 @@ def test_thermostat_curve_returns_while_non_modal(monkeypatch):
     controller.show_thermostat_dialog(curve)
     assert controller._thermostat_dialog is not first
     assert first.closed is True
+    assert first.deleted is True
     assert controller.thermostat_model.temperature_curve_data == {"kept": True}
     assert controller.thermostat_model.cleared == 0
     controller._thermostat_dialog.close()
     assert controller.thermostat_model.cleared == 1
     assert controller._thermostat_dialog is None
+
+
+class _Button:
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+
+    def isEnabled(self):
+        return self.enabled
+
+    def setEnabled(self, enabled):
+        self.enabled = enabled
+
+
+def test_running_cinema_refuses_reload_and_recalculation(monkeypatch):
+    """A non-modal progress dialog must not let a second load replace the sequence."""
+    _install_widget_fakes(monkeypatch)
+    view = _StatusView()
+    view.all_real_files = ["r0", "r1"]
+    view.all_imag_files = ["i0", "i1"]
+    view.frame_counts = (2, 2, 0)
+    view.original_temp_input = _Spin()
+    view.gaussian_filter_checkbox = _Checked(False)
+    view.b0_correction_checkbox = _Checked(False)
+    view.motion_correction_checkbox = _Checked(False)
+    view.load_sequence_button = _Button()
+    view.calc_button = _Button(enabled=False)
+
+    cinema = AdvancedFeaturesController.__new__(AdvancedFeaturesController)
+    cinema.view = view
+    cinema.registrar = None
+    cinema.registration_config = None
+    cinema._cinema_stop = None
+    cinema._cinema_job = _Job()
+    cinema.generate_cinema()
+
+    assert view.sequence_busy is True
+    assert view.load_sequence_button.enabled is False
+    assert view.calc_button.enabled is False
+    assert view.errors == []
+
+    thermo = ThermometryController.__new__(ThermometryController)
+    thermo.view = view
+    thermo.model = _LoadModel()
+    thermo.model.real1 = "kept"
+    calculated = []
+    thermo.calculate_temperature = lambda *_args, **_kwargs: calculated.append(True)
+
+    thermo.batch_load_dicom(["/does/not/need/to/exist"])
+    assert view.all_real_files == ["r0", "r1"]
+    assert view.all_imag_files == ["i0", "i1"]
+    assert view.frame_counts == (2, 2, 0)
+    assert thermo.model.real1 == "kept"
+    assert "already running" in view.errors[-1]
+    assert "loading another sequence" in view.errors[-1]
+
+    thermo.begin_calculate_temperature(37.0, False, False, True)
+    assert calculated == []
+    assert "already running" in view.errors[-1]
+    assert "calculating a temperature" in view.errors[-1]
+
+    folder_view = ThermometryView.__new__(ThermometryView)
+    folder_view.sequence_busy = True
+    folder_view.errors = []
+    folder_view.show_error = folder_view.errors.append
+    folder_view.on_batch_load_folders()
+    assert "loading another sequence" in folder_view.errors[-1]
+
+    cinema._cinema_finished(["frame"])
+    assert view.sequence_busy is False
+    assert view.load_sequence_button.enabled is True
+    # Motion correction had already disabled Calculate; Cinema must not turn it back on.
+    assert view.calc_button.enabled is False

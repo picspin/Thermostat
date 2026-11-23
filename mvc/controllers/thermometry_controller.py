@@ -192,6 +192,12 @@ class ThermometryController:
         registration that the user did not cancel uses the same accept and
         fallback rules as ``calculate_temperature``.
         """
+        if getattr(self.view, "sequence_busy", False):
+            self.view.show_error(
+                "A temperature sequence is already running. "
+                "Wait for it to finish or cancel it before calculating a temperature."
+            )
+            return
         missing = (
             self.model.real1 is None
             or self.model.imag1 is None
@@ -626,6 +632,12 @@ class ThermometryController:
 
     def batch_load_dicom(self, folder_paths):
         """Process DICOM files from multiple folders."""
+        if getattr(self.view, "sequence_busy", False):
+            self.view.show_error(
+                "A temperature sequence is already running. "
+                "Wait for it to finish or cancel it before loading another sequence."
+            )
+            return
         if not folder_paths:
             return
             
@@ -841,7 +853,7 @@ class ThermometryController:
         if real_count <= 0:
             missing.append("real")
         if imag_count <= 0:
-            missing.append("imaginary")
+            missing.append("imag")
         stored = (
             f"Stored {real_count} real frames and {imag_count} imaginary frames"
         )

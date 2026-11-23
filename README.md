@@ -100,7 +100,7 @@ MR热统计系统是一个用于磁共振成像（MRI）热图分析的Python应
 
 ### Cinema 和 CEM43
 1. 先用主窗口 **Load DICOM Sequence** 装入至少两个时相（实部和虚部都要有）。还没加载时，**Generate Cinema** 会提示先用 **Load DICOM Sequence**，并写明缺的是 real 还是 imag。
-2. 点 **Generate Cinema**，或用菜单 **Batch → Cinema**。计算期间主窗口仍可操作；进度窗口标题是 “Generating Temperature Sequence”，可以取消。取消只停止下一帧，已经算出的帧保留。播放窗口标题是 “Temperature Map Cinema”，按钮是 Play、Stop、Save Video。
+2. 点 **Generate Cinema**，或用菜单 **Batch → Cinema**。计算期间主窗口仍可操作（可以看图、画 ROI）；**Load DICOM Sequence** 和 **Calculate Temperature Change** 会先被拒绝，避免把正在算的序列换成另一套。进度窗口标题是 “Generating Temperature Sequence”，可以取消。取消只停止下一帧，已经算出的帧保留。播放窗口标题是 “Temperature Map Cinema”，按钮是 Play、Stop、Save Video。
 3. 未勾选 **Apply Motion Correction** 时会弹出 “CEM43 thermal dose”，说明不显示 CEM43，因为这时每帧是相邻温差加基线，界面不给出剂量数字。勾选运动校正后，每一帧相对第一帧，配准被接受的帧才会进入 “CEM43 thermal dose” 窗口。配准使误差变大或折叠的帧会被丢掉，不会用上一帧填上。
 4. 剂量窗口里的 **39°C reference line**、**CEM43 = 2 reference line**、**CEM43 = 9 reference line** 默认不勾。说明文字写明这是 van Rhoon 等 Eur Radiol 2013 的射频安全参考，不是治疗完成。主窗口上先画好 ROI，再点 **Update ROI curves** 更新曲线。剂量窗口和播放器都是非模态的。
 5. **Generate Thermostat** 需要已经算完的 Cinema 序列和主窗口上的 ROI，窗口标题是 “ROI Temperature-Time Curve”。这个曲线窗口也是非模态的，打开时仍可以在主窗口画 ROI。

@@ -104,6 +104,12 @@ class AdvancedFeaturesController:
                 self.view.show_error("A temperature sequence is already running")
                 return
 
+            # The progress dialog is non-modal, so the old WindowModal lock
+            # no longer blocks the main window.  Refuse a second sequence
+            # load or a two-frame calculation until this worker finishes.
+            # Cancel still only drops frames that have not been stored.
+            self._set_sequence_busy(True)
+
             # Create progress dialog.  The sequence itself runs on a worker,
             # so this dialog can paint and its Cancel button can be clicked.
             # Cancel stops before the next frame; it does not change a frame
@@ -167,8 +173,34 @@ class AdvancedFeaturesController:
         except Exception as e:
             import traceback
             traceback.print_exc()
+            self._set_sequence_busy(False)
             self.view.show_error(f"Error generating cinema: {str(e)}")
             self._close_cinema_progress()
+
+    def _set_sequence_busy(self, busy):
+        """Block sequence reload and two-frame calculation while Cinema runs.
+
+        The enabled state of those buttons is restored afterwards, including
+        a Calculate button that motion correction had already disabled.
+        """
+        self.view.sequence_busy = bool(busy)
+        names = ("load_sequence_button", "calc_button")
+        if busy:
+            saved = {}
+            for name in names:
+                button = getattr(self.view, name, None)
+                if button is None or not hasattr(button, "setEnabled"):
+                    continue
+                is_enabled = getattr(button, "isEnabled", None)
+                saved[name] = True if not callable(is_enabled) else bool(is_enabled())
+                button.setEnabled(False)
+            self._sequence_button_state = saved
+            return
+        for name, enabled in getattr(self, "_sequence_button_state", {}).items():
+            button = getattr(self.view, name, None)
+            if button is not None and hasattr(button, "setEnabled"):
+                button.setEnabled(enabled)
+        self._sequence_button_state = {}
 
     def _registration_config_for_run(self):
         """Config for this sequence.
@@ -221,10 +253,12 @@ class AdvancedFeaturesController:
         ``calculation_complete`` already opens the player when the model
         returns a list.  An early ``None`` does not emit that signal.
         """
+        self._set_sequence_busy(False)
         if sequence is None:
             self._close_cinema_progress()
 
     def _cinema_failed(self, message):
+        self._set_sequence_busy(False)
         self._close_cinema_progress()
         self.view.show_error(f"Error generating cinema: {message}")
 
@@ -686,6 +720,11 @@ class AdvancedFeaturesController:
         if previous is not None and previous is not thermostat_dialog:
             previous.blockSignals(True)
             previous.close()
+            # close() only hides a non-modal dialog.  Drop it so repeated
+            # curve refreshes do not keep every previous window alive.
+            delete_later = getattr(previous, "deleteLater", None)
+            if callable(delete_later):
+                delete_later()
         thermostat_dialog.setWindowModality(Qt.NonModal)
         thermostat_dialog.setModal(False)
         thermostat_dialog.show()
