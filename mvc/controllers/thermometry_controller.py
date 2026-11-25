@@ -192,6 +192,12 @@ class ThermometryController:
         registration that the user did not cancel uses the same accept and
         fallback rules as ``calculate_temperature``.
         """
+        if getattr(self.view, "sequence_busy", False):
+            self.view.show_error(
+                "A temperature sequence is already running. "
+                "Wait for it to finish or cancel it before calculating a temperature."
+            )
+            return
         missing = (
             self.model.real1 is None
             or self.model.imag1 is None
@@ -431,7 +437,10 @@ class ThermometryController:
             parent,
         )
         dialog.setWindowTitle("Motion correction")
-        dialog.setWindowModality(Qt.WindowModal)
+        # Non-modal so the main window stays usable while SimpleITK runs.
+        # Cancel still drops a result that has not been applied.
+        dialog.setWindowModality(Qt.NonModal)
+        dialog.setModal(False)
         dialog.setMinimumDuration(0)
         dialog.setAutoClose(False)
         dialog.setAutoReset(False)
@@ -623,6 +632,12 @@ class ThermometryController:
 
     def batch_load_dicom(self, folder_paths):
         """Process DICOM files from multiple folders."""
+        if getattr(self.view, "sequence_busy", False):
+            self.view.show_error(
+                "A temperature sequence is already running. "
+                "Wait for it to finish or cancel it before loading another sequence."
+            )
+            return
         if not folder_paths:
             return
             
@@ -827,5 +842,25 @@ class ThermometryController:
         self.view.all_real_files = [file['path'] for file in real_files]
         self.view.all_imag_files = [file['path'] for file in imag_files]
 
-        # Log the stored files
-        self.view.update_status(f"Stored {len(self.view.all_real_files)} real files and {len(self.view.all_imag_files)} imaginary files for Cinema feature")
+        # The transient line still scrolls away.  The permanent status-bar
+        # label keeps the counts and names a missing real or imaginary set.
+        real_count = len(self.view.all_real_files)
+        imag_count = len(self.view.all_imag_files)
+        b0_count = len(b0_files)
+        if hasattr(self.view, "set_frame_counts"):
+            self.view.set_frame_counts(real_count, imag_count, b0_count)
+        missing = []
+        if real_count <= 0:
+            missing.append("real")
+        if imag_count <= 0:
+            missing.append("imag")
+        stored = (
+            f"Stored {real_count} real frames and {imag_count} imaginary frames"
+        )
+        if b0_count:
+            stored += f" and {b0_count} B0"
+        if missing:
+            stored += " (missing: " + ", ".join(missing) + ")"
+        else:
+            stored += " for Cinema feature"
+        self.view.update_status(stored)

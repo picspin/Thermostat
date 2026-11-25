@@ -72,16 +72,21 @@ MR热统计系统是一个用于磁共振成像（MRI）热图分析的Python应
 
 界面文字是英文。下面用的是窗口上的原标签。
 
-### 批量加载 DICOM 文件夹
-1. 打开菜单 **Batch → Load Folders**。主窗口没有名为 “Batch Load DICOM Files” 的按钮。
+### 两帧温度
+1. 主窗口分组 **Two-frame temperature** 里用 **Load 1st Real DICOM**、**Load 1st Imaginary DICOM**、**Load 2nd Real DICOM**、**Load 2nd Imaginary DICOM**。需要 B0 时再点 **Load B0 Map DICOM**。主窗口没有名为 “Batch Load DICOM Files” 的按钮。
+2. 按需要勾选下面的处理选项，然后点 **Calculate Temperature Change**。
+
+### 序列（Cinema、CEM43、ROI 曲线）
+1. 主窗口分组 **Sequence** 里点 **Load DICOM Sequence**。菜单 **File → Load → Load DICOM Sequence** 和 **Batch → Load Folders** 是同一个入口。
 2. 在标题为 “Select DICOM Folders” 的窗口里点 **Add Folder**，加入含 `.dcm` 文件的文件夹。可以加多个文件夹，按住 Ctrl 多选后点 **OK**。程序会递归扫描，不在这里直接多选单个文件。
 3. 只认扩展名为 `.dcm` 的文件。实部、虚部靠 Image Type 或标签 (0008,9208) 里的 REAL / IMAGINARY，认不出时再看文件名里的 REAL / IMAG。B0 图靠 Series Description 或文件名里的 B0、FIELD、MAP。
-4. 至少两对实部和虚部才会装入 “Load 1st Real DICOM” 到 “Load 2nd Imaginary DICOM” 对应的数据。更多时相留给 Cinema。计算还需要 DICOM 里的 Echo Time 和 Magnetic Field Strength。
+4. 加载后状态栏右侧保持 “Sequence:” 帧数，例如 `4 real, 4 imag`。缺实部或虚部时写成 `(missing: real)` 或 `(missing: imag)`，分组里的下一步说明也会指出缺哪一类。
+5. 至少两对实部和虚部才会装入 “Load 1st Real DICOM” 到 “Load 2nd Imaginary DICOM” 对应的数据。更多时相留给 Cinema。计算还需要 DICOM 里的 Echo Time 和 Magnetic Field Strength。
 
 ### 计算温度图
 1. **Baseline Temperature (°C)** 默认是 37.0。
 2. 按需要勾选 **Apply Gaussian Filter**、**Apply B0 Correction**、**Apply Motion Correction**。运动校正的部位用 **Body part:**，选项是 Abdomen、Head、Joint，默认 Abdomen。**Use coarse liver ROI** 默认不勾，而且只在腹部并同时勾选运动校正时才参与配准。
-3. 点 **Calculate Temperature Change**。
+3. 点 **Calculate Temperature Change**。配准在后台线程里跑，进度窗口不挡住主窗口，取消只丢掉还没应用的结果。
 
 ### ROI 分析
 1. 在温度图上右键拖动绘制 ROI。左侧说明是 “Right-click and drag to draw ROI”。
@@ -94,11 +99,11 @@ MR热统计系统是一个用于磁共振成像（MRI）热图分析的Python应
 3. 点 **Auto Window** 按当前温度图调整。
 
 ### Cinema 和 CEM43
-1. 先用 **Batch → Load Folders** 装入至少三个时相。只算一张温度图时，**Generate Cinema** 会提示先做批量文件夹加载。
-2. 点 **Generate Cinema**，或用菜单 **Batch → Cinema**。播放窗口标题是 “Temperature Map Cinema”，按钮是 Play、Stop、Save Video。
-3. 未勾选 **Apply Motion Correction** 时会弹出 “CEM43 thermal dose”，说明不显示 CEM43，因为这时每帧是相邻温差加基线。勾选运动校正后，每一帧相对第一帧，配准被接受的帧才会进入 “CEM43 thermal dose” 窗口。配准使误差变大或折叠的帧会被丢掉，不会用上一帧填上。
-4. 剂量窗口里的 **39°C reference line**、**CEM43 = 2 reference line**、**CEM43 = 9 reference line** 默认不勾。说明文字写明这是 van Rhoon 等 Eur Radiol 2013 的射频安全参考，不是治疗完成。主窗口上先画好 ROI，再点 **Update ROI curves** 更新曲线。
-5. **Generate Thermostat** 需要已经算完的 Cinema 序列和主窗口上的 ROI，窗口标题是 “ROI Temperature-Time Curve”。
+1. 先用主窗口 **Load DICOM Sequence** 装入至少两个时相（实部和虚部都要有）。还没加载时，**Generate Cinema** 会提示先用 **Load DICOM Sequence**，并写明缺的是 real 还是 imag。
+2. 点 **Generate Cinema**，或用菜单 **Batch → Cinema**。计算期间主窗口仍可操作（可以看图、画 ROI）；**Load DICOM Sequence** 和 **Calculate Temperature Change** 会先被拒绝，避免把正在算的序列换成另一套。进度窗口标题是 “Generating Temperature Sequence”，可以取消。取消只停止下一帧，已经算出的帧保留。播放窗口标题是 “Temperature Map Cinema”，按钮是 Play、Stop、Save Video。
+3. 未勾选 **Apply Motion Correction** 时会弹出 “CEM43 thermal dose”，说明不显示 CEM43，因为这时每帧是相邻温差加基线，界面不给出剂量数字。勾选运动校正后，每一帧相对第一帧，配准被接受的帧才会进入 “CEM43 thermal dose” 窗口。配准使误差变大或折叠的帧会被丢掉，不会用上一帧填上。
+4. 剂量窗口里的 **39°C reference line**、**CEM43 = 2 reference line**、**CEM43 = 9 reference line** 默认不勾。说明文字写明这是 van Rhoon 等 Eur Radiol 2013 的射频安全参考，不是治疗完成。主窗口上先画好 ROI，再点 **Update ROI curves** 更新曲线。剂量窗口和播放器都是非模态的。
+5. **Generate Thermostat** 需要已经算完的 Cinema 序列和主窗口上的 ROI，窗口标题是 “ROI Temperature-Time Curve”。这个曲线窗口也是非模态的，打开时仍可以在主窗口画 ROI。
 
 ## 开发与测试
 
@@ -111,9 +116,9 @@ python -m pytest
 
 测试不需要显示服务器；配准模块的单元测试不依赖 Qt，模型状态测试只使用 QObject。
 
-勾选运动校正时，默认改为刚体对齐后再做约 40 mm 网格的 B-spline，相似度是半径 4 体素的局部相关，mask 是 Otsu 组织区再膨胀 12 mm。这会改变勾选后的温度图。`RegistrationConfig()` 仍是原来的单阶段 B-spline 和 Mattes MI，需要旧结果时显式传入。MIND 只有在配置里显式写 `metric="mind"` 时才启用，勾选框不会改用它，INR 也不变。它使用半径 1 的邻域自相似（2D 为 8 邻域，3D 为 26 邻域），采样步长默认 2 个体素：半径 1 已经覆盖相邻体素，步长 2 在每个内部邻域里留一个样本，又避免 Mattes 那种 10% 随机采样漏掉小结构。采样格在高索引一侧会空出最后一行/列；步长大于 `2 * radius + 1` 时，有的邻域里会一个样本都没有。两者都可以在配置里改，不改时就是这两个默认值。全局强度平移不改变这个描述子。归一化除的是整幅图的均值，不是逐体素邻域均值，这样和 INR 描述子保持同一个公式。moving 图像先变到固定网格再算描述子，邻域方向始终在固定图像上，旋转不会把通道对错。梯度是这次线性重采样的斜率，不生成整幅描述子梯度体。刚体和仿射的平移预热与完整求解共用 `iterations`，上报的迭代数不超过这个上限。mask 只按初始位姿取一次，初始偏差很大时可能直接失败。没有肝脏分割模型。运动校正勾选后的 mask 仍是 Otsu，不能把胸腹壁从肝脏里分开。界面上的部位选择默认是腹部，用 `liver_respiratory()`（刚体，再接约 40 mm 的 B-spline）。改成头部或关节后改用刚体预设：不用 40 mm 呼吸网格，也不用粗肝脏 ROI。头部和关节的掩膜仍是已有的 Otsu 再膨胀，没有新的肝分割。头部运动通常比腹部小，这只是预设理由，不是多期对齐已经验证；仓库里没有真实头部或关节序列。大幅屈伸可能失败，Cinema 仍丢掉该帧，不用上一帧冒充。另有一个默认不勾选的 “Use coarse liver ROI”：只有部位是腹部，并且它和运动校正同时勾选时，才改用粗肝脏 ROI。头部和关节即使勾着这个框，也不会改成 `mask_kind="coarse_liver"`。这个 ROI 用幅值 √(real²+imag²)，不用实部；没有虚部时才用 |real|。相位把组织实部变成负数或零时，实部会把 ROI 选成体壁，或直接报没有组织。配准度量本身仍然只看实部。这个 ROI 用图像四角估计空气噪声（四角中位数加 5 倍稳健标准差；四角不比内部更暗时改回 Otsu，避免没有空气背景的图被切空），把高于噪声的组织都留下。Otsu 在脂肪和肝脏之间切开时往往会只留下胸腹壁，这一步不会。然后再去掉约 20 mm 的体壁，只保留剩下的最大连通域。闭合半径是 `min(5 mm, 壁厚 / 2)`，用来补上被阈值断开的包膜，借来的外壳仍落在后面要删掉的壁里。它不是肝脏分割：体壁厚过 20 mm 会留下一圈，被组织包住的胃腔会被填上，脾或胃比剩下的区域更大时会选错。物体薄于这个壁厚时不去掉体壁，也不返回空 mask。`RegistrationConfig()` 和 `liver_respiratory()` 都不选它；代码里要写 `mask_kind="coarse_liver"`。只勾选这个 ROI、不勾选运动校正时，温度图不变。校正结果额外记录 NCC、MAE、位移和折叠比例，但这些数值不改变是否接受这次校正。界面上的运动校正在后台线程运行，取消会丢弃尚未应用的结果，不改变已经完成的配准。Cinema 只有在勾选运动校正时才配准，并且每一帧都以第一帧为参考；序列也在后台计算，取消只停止下一帧，已经算出的帧保留。另有一个必须显式启用的单病例 INR 容积校正（定位像投影轮廓加 MIND；不进入勾选框，也不进入温度计算），以及独立的低秩加稀疏分析；说明见 [docs/inr_volume_correction.md](docs/inr_volume_correction.md)。
+勾选运动校正时，默认改为刚体对齐后再做约 40 mm 网格的 B-spline，相似度是半径 4 体素的局部相关，mask 是 Otsu 组织区再膨胀 12 mm。这会改变勾选后的温度图。`RegistrationConfig()` 仍是原来的单阶段 B-spline 和 Mattes MI，需要旧结果时显式传入。MIND 只有在配置里显式写 `metric="mind"` 时才启用，勾选框不会改用它，INR 也不变。它使用半径 1 的邻域自相似（2D 为 8 邻域，3D 为 26 邻域），采样步长默认 2 个体素：半径 1 已经覆盖相邻体素，步长 2 在每个内部邻域里留一个样本，又避免 Mattes 那种 10% 随机采样漏掉小结构。采样格在高索引一侧会空出最后一行/列；步长大于 `2 * radius + 1` 时，有的邻域里会一个样本都没有。两者都可以在配置里改，不改时就是这两个默认值。全局强度平移不改变这个描述子。归一化除的是整幅图的均值，不是逐体素邻域均值，这样和 INR 描述子保持同一个公式。moving 图像先变到固定网格再算描述子，邻域方向始终在固定图像上，旋转不会把通道对错。梯度是这次线性重采样的斜率，不生成整幅描述子梯度体。刚体和仿射的平移预热与完整求解共用 `iterations`，上报的迭代数不超过这个上限。mask 只按初始位姿取一次，初始偏差很大时可能直接失败。没有肝脏分割模型。运动校正勾选后的 mask 仍是 Otsu，不能把胸腹壁从肝脏里分开。界面上的部位选择默认是腹部，用 `liver_respiratory()`（刚体，再接约 40 mm 的 B-spline）。改成头部或关节后改用刚体预设：不用 40 mm 呼吸网格，也不用粗肝脏 ROI。头部和关节的掩膜仍是已有的 Otsu 再膨胀，没有新的肝分割。头部运动通常比腹部小，这只是预设理由，不是多期对齐已经验证；仓库里没有真实头部或关节序列。大幅屈伸可能失败，Cinema 仍丢掉该帧，不用上一帧冒充。另有一个默认不勾选的 “Use coarse liver ROI”：只有部位是腹部，并且它和运动校正同时勾选时，才改用粗肝脏 ROI。头部和关节即使勾着这个框，也不会改成 `mask_kind="coarse_liver"`。这个 ROI 用幅值 √(real²+imag²)，不用实部；没有虚部时才用 |real|。相位把组织实部变成负数或零时，实部会把 ROI 选成体壁，或直接报没有组织。配准度量本身仍然只看实部。这个 ROI 用图像四角估计空气噪声（四角中位数加 5 倍稳健标准差；四角不比内部更暗时改回 Otsu，避免没有空气背景的图被切空），把高于噪声的组织都留下。Otsu 在脂肪和肝脏之间切开时往往会只留下胸腹壁，这一步不会。然后再去掉约 20 mm 的体壁，只保留剩下的最大连通域。闭合半径是 `min(5 mm, 壁厚 / 2)`，用来补上被阈值断开的包膜，借来的外壳仍落在后面要删掉的壁里。它不是肝脏分割：体壁厚过 20 mm 会留下一圈，被组织包住的胃腔会被填上，脾或胃比剩下的区域更大时会选错。物体薄于这个壁厚时不去掉体壁，也不返回空 mask。`RegistrationConfig()` 和 `liver_respiratory()` 都不选它；代码里要写 `mask_kind="coarse_liver"`。只勾选这个 ROI、不勾选运动校正时，温度图不变。校正结果额外记录 NCC、MAE、位移和折叠比例，但这些数值不改变是否接受这次校正。界面上的运动校正在后台线程运行，进度窗口不挡住主窗口，取消会丢弃尚未应用的结果，不改变已经完成的配准。Cinema 只有在勾选运动校正时才配准，并且每一帧都以第一帧为参考；序列也在后台计算，进度窗口同样不挡住主窗口，取消只停止下一帧，已经算出的帧保留。另有一个必须显式启用的单病例 INR 容积校正（定位像投影轮廓加 MIND；不进入勾选框，也不进入温度计算），以及独立的低秩加稀疏分析；说明见 [docs/inr_volume_correction.md](docs/inr_volume_correction.md)。
 
-Cinema 序列完成后会另外计算 CEM43。计算在 `mvc/models/thermal_dose.py`，不调用配准，也不读取 `RegistrationConfig`。它直接使用已经算出的温度图，不改配准、不改温度值。未勾选运动校正时，每一帧仍是相邻两帧的温差再加基线，不是相对第一帧的温度；这时不显示剂量数字，只报告原因，因为 CEM43 对温度是指数敏感，用温差去累加会把剂量低估几个数量级。勾选运动校正后，每一帧都相对第一帧，才显示 CEM43 图。剂量窗口和 Cinema 播放器都是非模态的，播放时仍可在主界面画 ROI 并刷新曲线。Δt 只来自 DICOM Acquisition Time (0008,0032)；没有这个标签就停止，不会改用 SeriesTime，也不会换成等间隔。低信号体素沿用温度计算里已有的 10% 幅值掩膜，温度图本身不改。掩膜把超过 95% 的有温度体素排除时，摘要会说明比例，并指出单个亮像素可能抬高阈值。ROI 曲线只统计每一帧都有效的体素。39°C、CEM43 = 2 和 CEM43 = 9 默认不画，勾选后也只标注为 van Rhoon 等，Eur Radiol 2013 的 MR 射频安全参考，不能当成治疗完成。
+Cinema 序列完成后会另外计算 CEM43。计算在 `mvc/models/thermal_dose.py`，不调用配准，也不读取 `RegistrationConfig`。它直接使用已经算出的温度图，不改配准、不改温度值。未勾选运动校正时，每一帧仍是相邻两帧的温差再加基线，不是相对第一帧的温度；这时不显示剂量数字，只报告原因，因为 CEM43 对温度是指数敏感，用温差去累加会把剂量低估几个数量级。勾选运动校正后，每一帧都相对第一帧，才显示 CEM43 图。剂量窗口、Cinema 播放器和 ROI 温度曲线都是非模态的，播放时仍可在主界面画 ROI 并刷新曲线。未勾选运动校正时仍然只说明为什么没有 CEM43，不显示那个数。Δt 只来自 DICOM Acquisition Time (0008,0032)；没有这个标签就停止，不会改用 SeriesTime，也不会换成等间隔。低信号体素沿用温度计算里已有的 10% 幅值掩膜，温度图本身不改。掩膜把超过 95% 的有温度体素排除时，摘要会说明比例，并指出单个亮像素可能抬高阈值。ROI 曲线只统计每一帧都有效的体素。39°C、CEM43 = 2 和 CEM43 = 9 默认不画，勾选后也只标注为 van Rhoon 等，Eur Radiol 2013 的 MR 射频安全参考，不能当成治疗完成。
 
 推送和拉取请求会运行 `.github/workflows/tests.yml`：安装依赖、`compileall` 和 `pytest`。它不启动图形界面。
 

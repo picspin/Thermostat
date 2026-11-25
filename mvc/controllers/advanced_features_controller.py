@@ -72,16 +72,26 @@ class AdvancedFeaturesController:
     def generate_cinema(self):
         """Generate a temperature map movie from sequence data."""
         try:
-            # Check if we have batch-loaded files
-            if not hasattr(self.view, 'all_real_files') or not hasattr(self.view, 'all_imag_files'):
-                self.view.show_error("No sequence data available. Please use 'Batch Load Folders' first.")
+            # Check if we have sequence files from Load DICOM Sequence.
+            real_files = getattr(self.view, "all_real_files", None) or []
+            imag_files = getattr(self.view, "all_imag_files", None) or []
+            if not real_files or not imag_files:
+                missing = []
+                if not real_files:
+                    missing.append("real")
+                if not imag_files:
+                    missing.append("imag")
+                self.view.show_error(
+                    "No sequence data available. Please use 'Load DICOM Sequence' first. "
+                    "Missing: " + ", ".join(missing) + "."
+                )
                 return
-                
-            real_files = self.view.all_real_files
-            imag_files = self.view.all_imag_files
             
             if len(real_files) < 2 or len(imag_files) < 2:
-                self.view.show_error("Need at least 2 real and 2 imaginary files for Cinema feature.")
+                self.view.show_error(
+                    "Need at least 2 real and 2 imaginary files for Cinema feature. "
+                    f"Have {len(real_files)} real and {len(imag_files)} imaginary."
+                )
                 return
                 
             # Get processing options from view
@@ -94,6 +104,12 @@ class AdvancedFeaturesController:
                 self.view.show_error("A temperature sequence is already running")
                 return
 
+            # The progress dialog is non-modal, so the old WindowModal lock
+            # no longer blocks the main window.  Refuse a second sequence
+            # load or a two-frame calculation until this worker finishes.
+            # Cancel still only drops frames that have not been stored.
+            self._set_sequence_busy(True)
+
             # Create progress dialog.  The sequence itself runs on a worker,
             # so this dialog can paint and its Cancel button can be clicked.
             # Cancel stops before the next frame; it does not change a frame
@@ -101,7 +117,11 @@ class AdvancedFeaturesController:
             self.progress_dialog = QDialog(self.view)
             self.progress_dialog.setWindowTitle("Generating Temperature Sequence")
             self.progress_dialog.setFixedSize(400, 140)
-            self.progress_dialog.setWindowModality(Qt.WindowModal)
+            # Non-modal: registration and the sequence stay on the worker,
+            # and the main window can still be used.  Cancel stops before
+            # the next frame and does not rewrite frames already stored.
+            self.progress_dialog.setWindowModality(Qt.NonModal)
+            self.progress_dialog.setModal(False)
             
             layout = QVBoxLayout(self.progress_dialog)
             
@@ -153,8 +173,34 @@ class AdvancedFeaturesController:
         except Exception as e:
             import traceback
             traceback.print_exc()
+            self._set_sequence_busy(False)
             self.view.show_error(f"Error generating cinema: {str(e)}")
             self._close_cinema_progress()
+
+    def _set_sequence_busy(self, busy):
+        """Block sequence reload and two-frame calculation while Cinema runs.
+
+        The enabled state of those buttons is restored afterwards, including
+        a Calculate button that motion correction had already disabled.
+        """
+        self.view.sequence_busy = bool(busy)
+        names = ("load_sequence_button", "calc_button")
+        if busy:
+            saved = {}
+            for name in names:
+                button = getattr(self.view, name, None)
+                if button is None or not hasattr(button, "setEnabled"):
+                    continue
+                is_enabled = getattr(button, "isEnabled", None)
+                saved[name] = True if not callable(is_enabled) else bool(is_enabled())
+                button.setEnabled(False)
+            self._sequence_button_state = saved
+            return
+        for name, enabled in getattr(self, "_sequence_button_state", {}).items():
+            button = getattr(self.view, name, None)
+            if button is not None and hasattr(button, "setEnabled"):
+                button.setEnabled(enabled)
+        self._sequence_button_state = {}
 
     def _registration_config_for_run(self):
         """Config for this sequence.
@@ -207,10 +253,12 @@ class AdvancedFeaturesController:
         ``calculation_complete`` already opens the player when the model
         returns a list.  An early ``None`` does not emit that signal.
         """
+        self._set_sequence_busy(False)
         if sequence is None:
             self._close_cinema_progress()
 
     def _cinema_failed(self, message):
+        self._set_sequence_busy(False)
         self._close_cinema_progress()
         self.view.show_error(f"Error generating cinema: {message}")
 
@@ -653,13 +701,31 @@ class AdvancedFeaturesController:
         # Connect save button
         save_button.clicked.connect(save_data)
         
-        # Memory management - clear data when dialog is closed
+        # Memory management - clear data when this dialog is still current.
         def on_thermostat_dialog_close():
-            # Clear curve data to free memory when not needed
+            # Only the dialog that still owns the curve may drop it.  A
+            # newer non-modal curve can open while this one is closing.
+            if getattr(self, "_thermostat_dialog", None) is not thermostat_dialog:
+                return
             self.thermostat_model.clear_data()
+            self._thermostat_dialog = None
             
         thermostat_dialog.finished.connect(on_thermostat_dialog_close)
-        
-        # Show the dialog
-        thermostat_dialog.exec_()
+
+        # show(), not exec_().  exec_() would block the main window, the
+        # Cinema player, and CEM43 ROI refresh.  The parent keeps the dialog
+        # alive; the attribute covers a view that is not a QObject parent.
+        previous = getattr(self, "_thermostat_dialog", None)
+        self._thermostat_dialog = thermostat_dialog
+        if previous is not None and previous is not thermostat_dialog:
+            previous.blockSignals(True)
+            previous.close()
+            # close() only hides a non-modal dialog.  Drop it so repeated
+            # curve refreshes do not keep every previous window alive.
+            delete_later = getattr(previous, "deleteLater", None)
+            if callable(delete_later):
+                delete_later()
+        thermostat_dialog.setWindowModality(Qt.NonModal)
+        thermostat_dialog.setModal(False)
+        thermostat_dialog.show()
  
