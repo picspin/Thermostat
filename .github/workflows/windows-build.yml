@@ -120,9 +120,13 @@ jobs:
           set -euo pipefail
           # Colon, not the Windows semicolon. --target-arch arm64 refuses a
           # universal2 bundle. Do not pass a codesign identity.
+          # --onefile matches the Windows packager. An onedir .app splits
+          # cv2 between Frameworks and Resources, and that loader then
+          # recurses on import. --windowed still emits MR_Thermometry.app.
           pyinstaller \
             --noconfirm \
             --clean \
+            --onefile \
             --windowed \
             --name MR_Thermometry \
             --target-arch arm64 \
@@ -152,15 +156,16 @@ jobs:
             exit 1
           fi
           log="${RUNNER_TEMP:-/tmp}/mr-thermometry-smoke.log"
-          # Nobody is on the runner to click the window. Fail only if the
-          # bundled executable dies during this window.
+          # Nobody is on the runner to click the window. The onefile bundle
+          # extracts before the window exists; fail only if that process
+          # dies before 90 seconds, same as the Windows exe.
           "$bin" >"$log" 2>&1 &
           pid=$!
-          deadline=$((SECONDS + 45))
+          deadline=$((SECONDS + 90))
           while (( SECONDS < deadline )); do
             sleep 3
             if ! kill -0 "$pid" 2>/dev/null; then
-              echo "MR_Thermometry exited before the 45 second smoke window."
+              echo "MR_Thermometry exited before the 90 second smoke window."
               wait "$pid" || true
               echo "--- stdout/stderr ---"
               cat "$log" || true
