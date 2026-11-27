@@ -3,8 +3,11 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# Windows build artifacts — never commit exe, zip, build or dist
+# Desktop build artifacts — never commit exe, app, zip, dmg, build or dist
 dist/
 build/
 *.spec
+*.app
+*.dmg
 /MR_Thermometry-windows.zip
+/MR_Thermometry-macos-arm64.dmg
