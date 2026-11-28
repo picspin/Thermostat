@@ -4,7 +4,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout, QSplitter, QTextEdit, QStatusBar, QGroupBox,
     QFormLayout, QDoubleSpinBox, QPushButton, QMenu, QAction, QInputDialog,
     QDialog, QListWidget, QAbstractItemView, QDialogButtonBox,
-    QProgressBar, QSlider
+    QProgressBar, QSlider, QScrollArea, QSizePolicy, QFrame
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QPoint, QTimer
 from PyQt5.QtGui import QPainter, QPen, QColor, QCursor, QIcon
@@ -209,6 +209,44 @@ class ThermometryView(QMainWindow):
         
         dicom_group.setLayout(dicom_layout)
         left_layout.addWidget(dicom_group)
+
+        # Window level sits in its own group, just under the two-frame loads,
+        # so a short window does not fold these rows inside Processing Options.
+        window_group = QGroupBox("Window", left_panel)
+        window_layout = QVBoxLayout()
+        center_label = QLabel("Window Center (°C):", window_group)
+        center_label.setWordWrap(False)
+        self.window_center_input = QDoubleSpinBox(self)
+        self.window_center_input.setRange(-100, 100)
+        self.window_center_input.setValue(37.0)
+        self.window_center_input.setSingleStep(0.5)
+        self.window_center_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.window_center_input.setMinimumHeight(24)
+        self.window_center_input.valueChanged.connect(self.on_window_level_changed)
+        center_label.setBuddy(self.window_center_input)
+        window_layout.addWidget(center_label)
+        window_layout.addWidget(self.window_center_input)
+
+        width_label = QLabel("Window Width (°C):", window_group)
+        width_label.setWordWrap(False)
+        self.window_width_input = QDoubleSpinBox(self)
+        self.window_width_input.setRange(0.1, 100)
+        self.window_width_input.setValue(10.0)
+        self.window_width_input.setSingleStep(0.5)
+        self.window_width_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.window_width_input.setMinimumHeight(24)
+        self.window_width_input.valueChanged.connect(self.on_window_level_changed)
+        width_label.setBuddy(self.window_width_input)
+        window_layout.addWidget(width_label)
+        window_layout.addWidget(self.window_width_input)
+
+        self.auto_window_button = QPushButton("Auto Window", self)
+        self.auto_window_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.auto_window_button.setMinimumHeight(28)
+        self.auto_window_button.clicked.connect(self.on_auto_window_level)
+        window_layout.addWidget(self.auto_window_button)
+        window_group.setLayout(window_layout)
+        left_layout.addWidget(window_group)
         
         # Processing Options Group
         options_group = QGroupBox("Processing Options")
@@ -221,31 +259,10 @@ class ThermometryView(QMainWindow):
         self.original_temp_input.setValue(37.0)
         self.original_temp_input.setSingleStep(0.1)
         self.original_temp_input.setDecimals(1)
+        self.original_temp_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.original_temp_input.setMinimumHeight(24)
         temp_layout.addRow("Baseline Temperature (°C):", self.original_temp_input)
         options_layout.addLayout(temp_layout)
-        
-        # 添加窗宽窗位控制
-        window_layout = QFormLayout()
-        self.window_center_input = QDoubleSpinBox(self)
-        self.window_center_input.setRange(-100, 100)
-        self.window_center_input.setValue(37.0)
-        self.window_center_input.setSingleStep(0.5)
-        self.window_center_input.valueChanged.connect(self.on_window_level_changed)
-        window_layout.addRow("Window Center (°C):", self.window_center_input)
-        
-        self.window_width_input = QDoubleSpinBox(self)
-        self.window_width_input.setRange(0.1, 100)
-        self.window_width_input.setValue(10.0)
-        self.window_width_input.setSingleStep(0.5)
-        self.window_width_input.valueChanged.connect(self.on_window_level_changed)
-        window_layout.addRow("Window Width (°C):", self.window_width_input)
-        
-        # 添加自动窗宽窗位按钮
-        auto_window_button = QPushButton("Auto Window", self)
-        auto_window_button.clicked.connect(self.on_auto_window_level)
-        window_layout.addRow("", auto_window_button)
-        
-        options_layout.addLayout(window_layout)
         
         # Processing checkboxes
         self.gaussian_filter_checkbox = QCheckBox('Apply Gaussian Filter', self)
@@ -392,6 +409,23 @@ class ThermometryView(QMainWindow):
 
         # Add stretch to push everything up
         left_layout.addStretch()
+
+        # Do not pre-set a minimum size on the inner panel. QScrollArea with
+        # widgetResizable shrinks the child down to its minimumSize; the floor
+        # is applied after the layout is filled (see _freeze_left_panel_minimum).
+        self.left_panel = left_panel
+        left_scroll = QScrollArea()
+        left_scroll.setObjectName("left_panel_scroll")
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        left_scroll.setWidget(left_panel)
+        # Placeholder until _freeze_left_panel_minimum sizes the column to
+        # the widest row (the paired DICOM buttons). 340 is not wide enough
+        # for those rows, and a narrower viewport clips them.
+        left_scroll.setMinimumWidth(340)
+        self.left_panel_scroll = left_scroll
         
         # --- Create Right Panel (Display) ---
         right_panel = QWidget()
@@ -431,9 +465,14 @@ class ThermometryView(QMainWindow):
         
         # 添加分隔器
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(left_panel)
+        splitter.addWidget(left_scroll)
         splitter.addWidget(right_panel)
-        splitter.setSizes([300, 900])  # Set initial sizes
+        # Keep only the control column from being dragged to size 0.
+        # setChildrenCollapsible(False) would also freeze the image pane;
+        # setCollapsible is per index, so the right pane can still collapse.
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, True)
+        splitter.setSizes([340, 860])  # Set initial sizes
         main_vertical_layout.addWidget(splitter)
         
         # 添加作者信息
@@ -444,6 +483,49 @@ class ThermometryView(QMainWindow):
         
         # 将垂直布局添加到主布局
         main_layout.addLayout(main_vertical_layout)
+        self._freeze_left_panel_minimum()
+
+    def _freeze_left_panel_minimum(self):
+        """Floor the inner column so a short viewport scrolls instead of flattening rows.
+
+        The minimum height is a snapshot of the layout's totalMinimumSize.
+        Nothing adds widgets to this column after the window is shown.
+        showEvent refreshes the floor on show only. If controls are added
+        to the left column later, call this again after they are in the
+        layout; otherwise the new rows stay clipped until the next show.
+
+        The scroll area is widened to the layout's minimum width plus the
+        vertical scrollbar, so a row of buttons is fully visible instead of
+        sitting under a horizontal scrollbar. Growing wider is still allowed.
+        Do not call this before the left layout is filled.
+        """
+        lay = self.left_panel.layout()
+        if lay is None:
+            return
+        hint = lay.totalMinimumSize()
+        self.left_panel.setMinimumHeight(hint.height())
+        self.left_panel.setMinimumWidth(max(hint.width(), 320))
+
+        scroll = self.left_panel_scroll
+        bar_w = scroll.verticalScrollBar().sizeHint().width()
+        if bar_w <= 0:
+            bar_w = 16
+        # A couple of pixels of slack stops an off-by-one from bringing the
+        # horizontal bar back and shrinking the viewport again.
+        needed = max(hint.width(), 320) + bar_w + 2 * scroll.frameWidth() + 4
+        scroll.setMinimumWidth(needed)
+        splitter = scroll.parentWidget()
+        if isinstance(splitter, QSplitter):
+            sizes = splitter.sizes()
+            if len(sizes) >= 2 and sizes[0] < needed:
+                extra = needed - sizes[0]
+                sizes[0] = needed
+                sizes[1] = max(0, sizes[1] - extra)
+                splitter.setSizes(sizes)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._freeze_left_panel_minimum()
         
     def setup_connections(self):
         """Set up internal signal connections."""
