@@ -421,6 +421,9 @@ class ThermometryView(QMainWindow):
         left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         left_scroll.setWidget(left_panel)
+        # Placeholder until _freeze_left_panel_minimum sizes the column to
+        # the widest row (the paired DICOM buttons). 340 is not wide enough
+        # for those rows, and a narrower viewport clips them.
         left_scroll.setMinimumWidth(340)
         self.left_panel_scroll = left_scroll
         
@@ -481,8 +484,10 @@ class ThermometryView(QMainWindow):
     def _freeze_left_panel_minimum(self):
         """Floor the inner column so a short viewport scrolls instead of flattening rows.
 
-        Growing wider than this floor is still allowed. Do not call this before
-        the left layout is filled: a pre-set minimum makes Qt skip later updates.
+        The scroll area is widened to the layout's minimum width plus the
+        vertical scrollbar, so a row of buttons is fully visible instead of
+        sitting under a horizontal scrollbar. Growing wider is still allowed.
+        Do not call this before the left layout is filled.
         """
         lay = self.left_panel.layout()
         if lay is None:
@@ -490,6 +495,23 @@ class ThermometryView(QMainWindow):
         hint = lay.totalMinimumSize()
         self.left_panel.setMinimumHeight(hint.height())
         self.left_panel.setMinimumWidth(max(hint.width(), 320))
+
+        scroll = self.left_panel_scroll
+        bar_w = scroll.verticalScrollBar().sizeHint().width()
+        if bar_w <= 0:
+            bar_w = 16
+        # A couple of pixels of slack stops an off-by-one from bringing the
+        # horizontal bar back and shrinking the viewport again.
+        needed = max(hint.width(), 320) + bar_w + 2 * scroll.frameWidth() + 4
+        scroll.setMinimumWidth(needed)
+        splitter = scroll.parentWidget()
+        if isinstance(splitter, QSplitter):
+            sizes = splitter.sizes()
+            if len(sizes) >= 2 and sizes[0] < needed:
+                extra = needed - sizes[0]
+                sizes[0] = needed
+                sizes[1] = max(0, sizes[1] - extra)
+                splitter.setSizes(sizes)
 
     def showEvent(self, event):
         super().showEvent(event)

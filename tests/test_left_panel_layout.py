@@ -58,21 +58,27 @@ def _box_in(widget, ancestor):
 
 
 def _assert_fully_in_viewport(widget, viewport):
-    top, bottom, _, _ = _box_in(widget, viewport)
-    assert top >= -_SLACK, (widget.objectName() or type(widget).__name__, top)
+    top, bottom, left, right = _box_in(widget, viewport)
+    name = widget.objectName() or type(widget).__name__
+    assert top >= -_SLACK, (name, top)
     assert bottom <= viewport.height() + _SLACK, (
-        widget.objectName() or type(widget).__name__,
+        name,
         bottom,
         viewport.height(),
     )
+    assert left >= -_SLACK, (name, left)
+    assert right <= viewport.width() + _SLACK, (name, right, viewport.width())
 
 
 def _assert_visible_without_scrolling(view, scroll, controls):
     bar = scroll.verticalScrollBar()
     assert bar.value() == 0
+    # The column is wide enough for its rows, so nothing is clipped sideways.
+    assert scroll.horizontalScrollBar().maximum() == 0
     viewport = scroll.viewport()
     for widget in controls:
         assert widget.height() >= 20
+        assert widget.width() >= 20
         _assert_fully_in_viewport(widget, viewport)
 
 
@@ -81,7 +87,7 @@ def test_left_panel_scroll_keeps_window_controls_visible():
     try:
         scroll = _left_scroll(view)
         assert scroll.widget() is view.left_panel
-        assert 320 <= scroll.minimumWidth() <= 360
+        assert scroll.minimumWidth() >= 320
 
         splitters = [
             splitter
