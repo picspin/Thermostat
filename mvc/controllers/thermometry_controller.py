@@ -1,8 +1,8 @@
-import os
 import numpy as np
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication, QProgressDialog, QWidget
 from mvc.controllers.background_work import BackgroundCall
+from mvc.models.sequence_import import import_sequences
 from mvc.models.registration import (
     SimpleITKRegistrar,
     body_part_from_view,
@@ -12,7 +12,6 @@ from mvc.models.registration import (
     default_registration_config,
     with_coarse_liver_mask,
 )
-import pydicom
 from datetime import datetime
 import csv
 
@@ -43,15 +42,11 @@ class ThermometryController:
         
     def connect_signals(self):
         """Connect View signals to Controller methods."""
-        # DICOM loading signals
-        self.view.load_real1_signal.connect(self.load_real1)
-        self.view.load_imag1_signal.connect(self.load_imag1)
-        self.view.load_real2_signal.connect(self.load_real2)
-        self.view.load_imag2_signal.connect(self.load_imag2)
+        # B0 stays a separate optional load.  Baseline and sequence share one signal.
         self.view.load_b0_map_signal.connect(self.load_b0_map)
         
-        # 添加批量加载信号连接
-        self.view.batch_load_dicom_signal.connect(self.batch_load_dicom)
+        # Baseline and sequence imports share one signal.  The view sets the role.
+        self.view.batch_load_dicom_signal.connect(self._load_from_view)
         
         # Calculation and reset signals.  The direct method stays synchronous
         # for tests and for the no-registration path.  The GUI slot moves only
@@ -630,8 +625,21 @@ class ThermometryController:
         else:
             self.view.show_error(f"Failed to load ROI '{name}'")
 
-    def batch_load_dicom(self, folder_paths):
-        """Process DICOM files from multiple folders."""
+    def _load_from_view(self, folder_paths):
+        """GUI slot.  The view names the role and any NIfTI component choice."""
+        role = getattr(self.view, "import_role", "sequence") or "sequence"
+        pair = getattr(self.view, "import_component_pair", None)
+        self.batch_load_dicom(folder_paths, role=role, component_pair=pair)
+
+    def batch_load_dicom(self, folder_paths, role="sequence", component_pair=None):
+        """Import a baseline sequence or the comparison / Cinema sequence.
+
+        ``role`` is ``baseline`` or ``sequence``.  Two-frame temperature uses
+        the first baseline frame against the first sequence frame.  With no
+        baseline, a self-contained sequence uses volume 0 as the reference
+        and the next volume as the comparison.  Cinema keeps every sequence
+        frame, time-sorted, and its first frame is the reference.
+        """
         if getattr(self.view, "sequence_busy", False):
             self.view.show_error(
                 "A temperature sequence is already running. "
@@ -640,213 +648,56 @@ class ThermometryController:
             return
         if not folder_paths:
             return
-            
-        # 扫描文件夹中的所有DICOM文件
-        dicom_files = []
-        
-        for folder_path in folder_paths:
-            # 递归查找文件夹中的所有DICOM文件
-            for root, dirs, files in os.walk(folder_path):
-                for file in files:
-                    if file.lower().endswith('.dcm'):
-                        dicom_files.append(os.path.join(root, file))
-        
-        if not dicom_files:
-            self.view.show_error("No DICOM files found in the selected folder(s)")
+        if role not in ("baseline", "sequence"):
+            self.view.show_error(f"Unknown import role: {role}")
             return
-            
-        self.view.update_status(f"Found {len(dicom_files)} DICOM files. Analyzing...")
-        
-        # 临时存储所有DICOM的采集时间和类型信息
-        dicom_acquisitions = []
-        
-        # 分析所有DICOM文件
-        for file_path in dicom_files:
-            try:
-                ds = pydicom.dcmread(file_path)
-                
-                # 初始化图像类型和采集时间
-                image_type = None
-                is_real = False
-                is_imaginary = False
-                is_b0_map = False
-                
-                # 直接使用标签(0008,9208)检查ImageType以确定实部/虚部
-                # 注意: pydicom需要以16进制访问标签
-                try:
-                    # 尝试直接访问ImageType标签(0008,9208)
-                    image_type_value = str(ds.get((0x0008, 0x9208), ""))
-                    if image_type_value:
-                        self.view.update_status(f"Found ImageType (0008,9208): {image_type_value}")
-                        if 'REAL' in image_type_value.upper():
-                            image_type = 'real'
-                            is_real = True
-                        elif 'IMAGINARY' in image_type_value.upper() or 'IMAG' in image_type_value.upper():
-                            image_type = 'imaginary'
-                            is_imaginary = True
-                except Exception as e:
-                    self.view.update_status(f"Error accessing ImageType tag (0008,9208): {e}")
-                
-                # 如果无法通过(0008,9208)标签确定，尝试通过普通ImageType属性
-                if not image_type:
-                    if hasattr(ds, 'ImageType') and isinstance(ds.ImageType, (list, tuple)):
-                        image_type_str = ' '.join(ds.ImageType).upper()
-                        self.view.update_status(f"Using ImageType attribute: {image_type_str}")
-                        if 'REAL' in image_type_str:
-                            image_type = 'real'
-                            is_real = True
-                        elif 'IMAGINARY' in image_type_str or 'IMAG' in image_type_str:
-                            image_type = 'imaginary'
-                            is_imaginary = True
-                
-                # 直接使用标签(0008,002A)检查AcquisitionDateTime确定采集顺序
-                acq_time = None
-                try:
-                    # 尝试直接访问AcquisitionDateTime标签(0008,002A)
-                    acq_datetime = str(ds.get((0x0008, 0x002A), ""))
-                    if acq_datetime:
-                        acq_time = acq_datetime
-                        self.view.update_status(f"Found AcquisitionDateTime (0008,002A): {acq_time}")
-                except Exception as e:
-                    self.view.update_status(f"Error accessing AcquisitionDateTime tag (0008,002A): {e}")
-                
-                # 如果无法获取(0008,002A)，尝试其他方式获取时间信息
-                if not acq_time:
-                    if hasattr(ds, 'AcquisitionDateTime'):
-                        acq_time = ds.AcquisitionDateTime
-                        self.view.update_status(f"Using AcquisitionDateTime attribute: {acq_time}")
-                    elif hasattr(ds, 'SeriesTime'):
-                        acq_time = ds.SeriesTime
-                        self.view.update_status(f"Using SeriesTime attribute: {acq_time}")
-                    elif hasattr(ds, 'SeriesDate') and hasattr(ds, 'SeriesTime'):
-                        acq_time = ds.SeriesDate + ds.SeriesTime
-                        self.view.update_status(f"Using SeriesDate+SeriesTime: {acq_time}")
-                
-                # 检查是否是B0 map（通过SeriesDescription中的关键词）
-                if hasattr(ds, 'SeriesDescription') and isinstance(ds.SeriesDescription, str):
-                    series_desc = ds.SeriesDescription.upper()
-                    if 'B0' in series_desc or 'FIELD' in series_desc or 'MAP' in series_desc:
-                        is_b0_map = True
-                        image_type = 'b0_map'
-                        self.view.update_status(f"Found B0 map: {os.path.basename(file_path)}")
-                
-                # 如果仍无法确定，尝试通过文件名识别
-                if not image_type and not is_b0_map:
-                    file_name = os.path.basename(file_path).upper()
-                    if 'REAL' in file_name:
-                        image_type = 'real'
-                        is_real = True
-                        self.view.update_status(f"Identified as real from filename: {os.path.basename(file_path)}")
-                    elif 'IMAG' in file_name:
-                        image_type = 'imaginary'
-                        is_imaginary = True
-                        self.view.update_status(f"Identified as imaginary from filename: {os.path.basename(file_path)}")
-                    elif 'B0' in file_name or 'FIELD' in file_name or 'MAP' in file_name:
-                        image_type = 'b0_map'
-                        is_b0_map = True
-                        self.view.update_status(f"Identified as B0 map from filename: {os.path.basename(file_path)}")
-                
-                # 只有当我们成功识别了类型时才添加文件
-                if image_type:
-                    dicom_acquisitions.append({
-                        'path': file_path,
-                        'acq_time': acq_time,
-                        'image_type': image_type,
-                        'is_real': is_real,
-                        'is_imaginary': is_imaginary,
-                        'is_b0_map': is_b0_map,
-                        'filename': os.path.basename(file_path)
-                    })
-                    self.view.update_status(f"Added file: {os.path.basename(file_path)} as {image_type}")
-                else:
-                    self.view.update_status(f"Warning: Could not identify type of {os.path.basename(file_path)}")
-                
-            except Exception as e:
-                self.view.show_error(f"Error reading DICOM file {os.path.basename(file_path)}: {str(e)}")
-                continue
-        
-        # 如果没有成功读取任何DICOM文件
-        if not dicom_acquisitions:
-            self.view.show_error("No valid DICOM files found or cannot identify file types")
+        try:
+            result = import_sequences(folder_paths, component_pair=component_pair)
+        except Exception as exc:
+            self.view.show_error(f"Failed to import images: {exc}")
             return
-        
-        # 按时间排序（对非B0文件）
-        real_files = [d for d in dicom_acquisitions if d['is_real']]
-        imag_files = [d for d in dicom_acquisitions if d['is_imaginary']]
-        b0_files = [d for d in dicom_acquisitions if d['is_b0_map']]
-        
-        self.view.update_status(f"Before sorting - Found {len(real_files)} real files, {len(imag_files)} imaginary files, {len(b0_files)} B0 map files")
-        
-        # 单独排序实部和虚部文件根据采集时间，确保较小的值是第1个
-        def sort_by_acq_time(files):
-            # 首先检查是否所有文件都有采集时间
-            if all(f['acq_time'] for f in files):
-                return sorted(files, key=lambda x: str(x['acq_time']))
-            else:
-                self.view.update_status("Warning: Not all files have acquisition time. Ordering may not be accurate.")
-                # 对于没有时间的文件，使用一个大值作为默认值
-                return sorted(files, key=lambda x: str(x['acq_time'] or '999999'))
-        
-        # 分别排序实部和虚部文件
-        if len(real_files) >= 2:
-            real_files = sort_by_acq_time(real_files)
-            self.view.update_status("Real files sorted by acquisition time")
-            for i, file in enumerate(real_files):
-                self.view.update_status(f"Sorted real file {i+1}: {file['filename']}, time: {file['acq_time']}")
-        
-        if len(imag_files) >= 2:
-            imag_files = sort_by_acq_time(imag_files)
-            self.view.update_status("Imaginary files sorted by acquisition time")
-            for i, file in enumerate(imag_files):
-                self.view.update_status(f"Sorted imaginary file {i+1}: {file['filename']}, time: {file['acq_time']}")
-        
-        # 确定第一组和第二组
-        if len(real_files) >= 2:
-            self.load_real1(real_files[0]['path'])
-            self.load_real2(real_files[1]['path'])
-            self.view.update_status(f"Loaded 1st real: {real_files[0]['filename']} (time: {real_files[0]['acq_time']})")
-            self.view.update_status(f"Loaded 2nd real: {real_files[1]['filename']} (time: {real_files[1]['acq_time']})")
-        elif len(real_files) == 1:
-            self.load_real1(real_files[0]['path'])
-            self.view.update_status(f"Warning: Only one real image found: {real_files[0]['filename']}. Need two for temperature calculation.")
-        else:
-            self.view.update_status("Warning: No real images found. Cannot calculate temperature.")
-        
-        if len(imag_files) >= 2:
-            self.load_imag1(imag_files[0]['path'])
-            self.load_imag2(imag_files[1]['path'])
-            self.view.update_status(f"Loaded 1st imaginary: {imag_files[0]['filename']} (time: {imag_files[0]['acq_time']})")
-            self.view.update_status(f"Loaded 2nd imaginary: {imag_files[1]['filename']} (time: {imag_files[1]['acq_time']})")
-        elif len(imag_files) == 1:
-            self.load_imag1(imag_files[0]['path'])
-            self.view.update_status(f"Warning: Only one imaginary image found: {imag_files[0]['filename']}. Need two for temperature calculation.")
-        else:
-            self.view.update_status("Warning: No imaginary images found. Cannot calculate temperature.")
-        
-        if b0_files:
-            self.load_b0_map(b0_files[0]['path'])
-            self.view.update_status(f"Loaded B0 map: {b0_files[0]['filename']}")
-        
-        # 显示加载结果摘要
-        loaded_files = []
-        if self.model.real1 is not None: loaded_files.append("1st Real")
-        if self.model.imag1 is not None: loaded_files.append("1st Imaginary")
-        if self.model.real2 is not None: loaded_files.append("2nd Real")
-        if self.model.imag2 is not None: loaded_files.append("2nd Imaginary")
-        if self.model.dem_b0_map is not None: loaded_files.append("B0 Map")
-        
-        summary = "Loaded DICOM files: " + ", ".join(loaded_files)
-        self.view.update_status(summary)
+        if result.problems:
+            self.view.show_error("Could not identify image type:\n" + "\n".join(result.problems))
+        if result.skipped:
+            self.view.update_status(
+                "Skipped unreadable: " + ", ".join(result.skipped)
+            )
+        if (
+            not result.real_sources
+            and not result.imag_sources
+            and not result.b0_paths
+        ):
+            if not result.problems:
+                detail = ""
+                if result.skipped:
+                    detail = " Skipped unreadable: " + ", ".join(result.skipped)
+                self.view.show_error(
+                    "No DICOM or NIfTI images found in the selected path(s)." + detail
+                )
+            return
 
-        # Store all real and imaginary files for Cinema feature
-        self.view.all_real_files = [file['path'] for file in real_files]
-        self.view.all_imag_files = [file['path'] for file in imag_files]
+        if role == "baseline":
+            self.view.baseline_real_files = list(result.real_sources)
+            self.view.baseline_imag_files = list(result.imag_sources)
+        else:
+            self.view.all_real_files = list(result.real_sources)
+            self.view.all_imag_files = list(result.imag_sources)
+        for path in result.b0_paths:
+            self.load_b0_map(path)
+        self._apply_two_frame()
 
-        # The transient line still scrolls away.  The permanent status-bar
-        # label keeps the counts and names a missing real or imaginary set.
+        if role == "baseline":
+            real_count = len(result.real_sources)
+            imag_count = len(result.imag_sources)
+            self.view.update_status(
+                f"Loaded baseline sequence: {real_count} real frames and "
+                f"{imag_count} imaginary frames"
+            )
+            return
+
         real_count = len(self.view.all_real_files)
         imag_count = len(self.view.all_imag_files)
-        b0_count = len(b0_files)
+        b0_count = len(result.b0_paths)
         if hasattr(self.view, "set_frame_counts"):
             self.view.set_frame_counts(real_count, imag_count, b0_count)
         missing = []
@@ -864,3 +715,36 @@ class ThermometryController:
         else:
             stored += " for Cinema feature"
         self.view.update_status(stored)
+
+    def _apply_two_frame(self):
+        """Point the two-frame buffers at the imported first frames.
+
+        A separate baseline wins as the reference.  Otherwise the sequence
+        is self-contained: its first frame is the baseline and the next
+        frame is the comparison.  Later frames stay on the sequence lists
+        for Cinema.
+        """
+        baseline_real = list(getattr(self.view, "baseline_real_files", None) or [])
+        baseline_imag = list(getattr(self.view, "baseline_imag_files", None) or [])
+        sequence_real = list(getattr(self.view, "all_real_files", None) or [])
+        sequence_imag = list(getattr(self.view, "all_imag_files", None) or [])
+        if baseline_real and baseline_imag and sequence_real and sequence_imag:
+            self.load_real1(baseline_real[0])
+            self.load_imag1(baseline_imag[0])
+            self.load_real2(sequence_real[0])
+            self.load_imag2(sequence_imag[0])
+            return
+        if not baseline_real and not baseline_imag:
+            if sequence_real:
+                self.load_real1(sequence_real[0])
+            if sequence_imag:
+                self.load_imag1(sequence_imag[0])
+            if len(sequence_real) >= 2:
+                self.load_real2(sequence_real[1])
+            if len(sequence_imag) >= 2:
+                self.load_imag2(sequence_imag[1])
+            return
+        if baseline_real:
+            self.load_real1(baseline_real[0])
+        if baseline_imag:
+            self.load_imag1(baseline_imag[0])
