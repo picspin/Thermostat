@@ -79,9 +79,9 @@ MR热统计系统是一个用于磁共振成像（MRI）热图分析的Python应
 ### 序列（Cinema、CEM43、ROI 曲线）
 1. 同一次导入可以是文件夹，也可以是文件。菜单 **File → Load → Load Sequence** 和 **Batch → Load Sequence** 与主窗口的 **Load Sequence** 是同一个入口；基线用 **Load Baseline Sequence**。
 2. 对话框里 **Add Folder** 递归扫描文件夹，**Add Files** 直接加入 DICOM 或 NIfTI。不要求 `.dcm` 后缀。也接受 `.nii` 和 `.nii.gz`。
-3. DICOM 的实部 / 虚部认 Image Type `(0008,0008)` 或 Complex Image Component `(0008,9208)` 里的 REAL / IMAGINARY，幅度 / 相位认 MAGNITUDE / PHASE。标签没有时再看文件名里的完整词 REAL、IMAG、MAG、PHASE。幅度加相位会合成 PRF 用的复数：有 Rescale Slope/Intercept 时相位用它；否则 0–4095 的整数码映射到 −π–π，不会把原始整数当成弧度。Series Description 里的 MAP 不会把已经认出的相位或幅度划成 B0。认不出的文件会在错误里写出文件名和看到的 Image Type、Complex Image Component。读失败的文件跳过，文件名出现在摘要里。
-4. 一个 4D NIfTI 按体序当时间序列，第 0 个体是基线，分量轴长度为 2（默认 real/imag；文件名或导入时选了 Magnitude + phase 则按幅度/相位）。两个 3D NIfTI 可以是一对 real+imag 或 magnitude+phase。NIfTI 没有 Acquisition Time。文件头 `aux_file` 或 `ITK_FileNotes` 里可以写 `TE=<ms>;B0=<tesla>`。没有这些参数时，温度计算仍会因为缺少 Echo Time 或 B0 而拒绝，不会发明默认值。
-5. 加载后状态栏右侧保持 “Sequence:” 帧数，例如 `4 real, 4 imag`。缺实部或虚部时写成 `(missing: real)` 或 `(missing: imag)`。Cinema / CEM43 用序列里按时间排好的各帧，第一帧就是参考。CEM43 缺 Acquisition Time 时仍拒绝，不会假设等间隔。
+3. DICOM 的实部 / 虚部认 Image Type `(0008,0008)` 或 Complex Image Component `(0008,9208)` 里的 REAL / IMAGINARY，幅度 / 相位认 MAGNITUDE / PHASE。西门子和飞利浦常用的第三值单字母也认：`M` 幅度、`P` 相位、`R` 实部、`I` 虚部（必须是第三个值本身，`MPR` 不算）。标签没有时再看文件名或 Series Description 里的完整词 REAL、IMAG、MAG、PHASE。幅度加相位会合成 PRF 用的复数。相位：Rescale Slope/Intercept 不是 1 和 0 时，缩放结果必须落在 −π…π，否则拒绝；没有有效缩放时，只把无符号 0–4095 的整数码映射到 −π–π（4095 对应 +π，不是按 4096 份来分）。有符号的 −2048…2047 不映射。原始整数不会当成弧度。B0 只认独立词 B0、FIELD、MAP，不会因为描述里有 MAGNITUDE MAP 就把幅度图当成 B0。认不出的文件会在错误里写出文件名和看到的 Image Type、Complex Image Component。读失败的文件跳过，文件名出现在摘要里；路径不存在会写成 Not found，而不是 unreadable。
+4. 一个 4D NIfTI 按体序当时间序列，第 0 个体是基线。SimpleITK 读出来的数组里，长度为 2 的那一轴是分量（优先轴 1，所以形状 `(2, 2, H, W)` 会当成两个时相的 real/imag，而不是两个层面）。默认 real/imag；文件名或导入时选了 Magnitude + phase 则按幅度/相位。3D NIfTI 只接受单层（可以有一个长度为 1 的层面），两个单层文件可以是一对 real+imag 或 magnitude+phase。同一次导入不要混 DICOM 和 NIfTI，混在一起会拒绝而不是接成一条时间序列。NIfTI 没有 Acquisition Time。文件头 `aux_file` 或 `ITK_FileNotes` 里可以写 `TE=<ms>;B0=<tesla>`。一次新导入会先丢掉上一次的 Echo Time 和 B0；这份数据里没有这些参数时，温度计算会拒绝，不会沿用上一份，也不会发明默认值。
+5. 加载后状态栏右侧保持 “Sequence:” 帧数，例如 `4 real, 4 imag`。缺实部或虚部时写成 `(missing: real)` 或 `(missing: imag)`。基线导入也会在状态里写缺哪一侧。不完整的两帧缓冲会被清掉，不会拿上一次的帧接着算。Cinema / CEM43 用序列里按时间排好的各帧，第一帧就是参考。有日期的采集时间按真正的时间排，只有 Acquisition Time 的文件排在有日期的文件之后。CEM43 缺 Acquisition Time 时仍拒绝，不会假设等间隔。
 
 ### 计算温度图
 1. **Baseline Temperature (°C)** 默认是 37.0。

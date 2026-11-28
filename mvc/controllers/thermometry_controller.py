@@ -81,6 +81,7 @@ class ThermometryController:
             self.view.update_dicom_info(self.model.dicom_header_info)
         else:
             self.view.show_error("Failed to load 1st real DICOM file")
+        return success
         
     def load_imag1(self, file_path):
         """Handle loading the 1st imaginary DICOM file."""
@@ -90,6 +91,7 @@ class ThermometryController:
             self.view.update_dicom_info(self.model.dicom_header_info)
         else:
             self.view.show_error("Failed to load 1st imaginary DICOM file")
+        return success
         
     def load_real2(self, file_path):
         """Handle loading the 2nd real DICOM file."""
@@ -99,6 +101,7 @@ class ThermometryController:
             self.view.update_dicom_info(self.model.dicom_header_info)
         else:
             self.view.show_error("Failed to load 2nd real DICOM file")
+        return success
         
     def load_imag2(self, file_path):
         """Handle loading the 2nd imaginary DICOM file."""
@@ -108,6 +111,7 @@ class ThermometryController:
             self.view.update_dicom_info(self.model.dicom_header_info)
         else:
             self.view.show_error("Failed to load 2nd imaginary DICOM file")
+        return success
         
     def load_b0_map(self, file_path):
         """Handle loading the B0 map DICOM file."""
@@ -658,6 +662,8 @@ class ThermometryController:
             return
         if result.problems:
             self.view.show_error("Could not identify image type:\n" + "\n".join(result.problems))
+        if result.missing:
+            self.view.update_status("Not found: " + ", ".join(result.missing))
         if result.skipped:
             self.view.update_status(
                 "Skipped unreadable: " + ", ".join(result.skipped)
@@ -668,9 +674,7 @@ class ThermometryController:
             and not result.b0_paths
         ):
             if not result.problems:
-                detail = ""
-                if result.skipped:
-                    detail = " Skipped unreadable: " + ", ".join(result.skipped)
+                detail = _empty_import_detail(result)
                 self.view.show_error(
                     "No DICOM or NIfTI images found in the selected path(s)." + detail
                 )
@@ -689,10 +693,9 @@ class ThermometryController:
         if role == "baseline":
             real_count = len(result.real_sources)
             imag_count = len(result.imag_sources)
-            self.view.update_status(
-                f"Loaded baseline sequence: {real_count} real frames and "
-                f"{imag_count} imaginary frames"
-            )
+            self.view.update_status(_frame_summary(
+                "Loaded baseline sequence", real_count, imag_count, len(result.b0_paths)
+            ))
             return
 
         real_count = len(self.view.all_real_files)
@@ -700,20 +703,9 @@ class ThermometryController:
         b0_count = len(result.b0_paths)
         if hasattr(self.view, "set_frame_counts"):
             self.view.set_frame_counts(real_count, imag_count, b0_count)
-        missing = []
-        if real_count <= 0:
-            missing.append("real")
-        if imag_count <= 0:
-            missing.append("imag")
-        stored = (
-            f"Stored {real_count} real frames and {imag_count} imaginary frames"
+        stored = _frame_summary(
+            "Stored", real_count, imag_count, b0_count, cinema=True
         )
-        if b0_count:
-            stored += f" and {b0_count} B0"
-        if missing:
-            stored += " (missing: " + ", ".join(missing) + ")"
-        else:
-            stored += " for Cinema feature"
         self.view.update_status(stored)
 
     def _apply_two_frame(self):
@@ -721,30 +713,85 @@ class ThermometryController:
 
         A separate baseline wins as the reference.  Otherwise the sequence
         is self-contained: its first frame is the baseline and the next
-        frame is the comparison.  Later frames stay on the sequence lists
-        for Cinema.
+        frame is the comparison.  Every slot this import does not fill is
+        cleared, including TE and B0, so a later calculation cannot reuse
+        the previous study.  Later frames stay on the sequence lists for
+        Cinema.
         """
+        self.model.te = None
+        self.model.b0 = None
+        self.model.pixel_spacing_mm = None
         baseline_real = list(getattr(self.view, "baseline_real_files", None) or [])
         baseline_imag = list(getattr(self.view, "baseline_imag_files", None) or [])
         sequence_real = list(getattr(self.view, "all_real_files", None) or [])
         sequence_imag = list(getattr(self.view, "all_imag_files", None) or [])
-        if baseline_real and baseline_imag and sequence_real and sequence_imag:
-            self.load_real1(baseline_real[0])
-            self.load_imag1(baseline_imag[0])
-            self.load_real2(sequence_real[0])
-            self.load_imag2(sequence_imag[0])
+        if baseline_real or baseline_imag:
+            reference_real = baseline_real[0] if baseline_real else None
+            reference_imag = baseline_imag[0] if baseline_imag else None
+            moving_real = sequence_real[0] if sequence_real else None
+            moving_imag = sequence_imag[0] if sequence_imag else None
+        else:
+            reference_real = sequence_real[0] if len(sequence_real) >= 1 else None
+            reference_imag = sequence_imag[0] if len(sequence_imag) >= 1 else None
+            moving_real = sequence_real[1] if len(sequence_real) >= 2 else None
+            moving_imag = sequence_imag[1] if len(sequence_imag) >= 2 else None
+        self._load_or_clear(self.load_real1, reference_real, "real1")
+        self._load_or_clear(self.load_imag1, reference_imag, "imag1")
+        self._load_or_clear(self.load_real2, moving_real, "real2")
+        self._load_or_clear(self.load_imag2, moving_imag, "imag2")
+        missing = []
+        if self.model.real1 is None:
+            missing.append("real reference")
+        if self.model.imag1 is None:
+            missing.append("imag reference")
+        if self.model.real2 is None:
+            missing.append("real comparison")
+        if self.model.imag2 is None:
+            missing.append("imag comparison")
+        if missing:
+            self.view.update_status(
+                "Two-frame temperature is incomplete (missing: "
+                + ", ".join(missing)
+                + "). Previous frames were cleared."
+            )
+
+    def _load_or_clear(self, loader, source, attr):
+        """Load one component, or drop the previous array when this import has none."""
+        if not source:
+            setattr(self.model, attr, None)
+            self.model.registration_result = None
             return
-        if not baseline_real and not baseline_imag:
-            if sequence_real:
-                self.load_real1(sequence_real[0])
-            if sequence_imag:
-                self.load_imag1(sequence_imag[0])
-            if len(sequence_real) >= 2:
-                self.load_real2(sequence_real[1])
-            if len(sequence_imag) >= 2:
-                self.load_imag2(sequence_imag[1])
-            return
-        if baseline_real:
-            self.load_real1(baseline_real[0])
-        if baseline_imag:
-            self.load_imag1(baseline_imag[0])
+        if not loader(source):
+            setattr(self.model, attr, None)
+            self.model.registration_result = None
+
+
+def _frame_summary(prefix, real_count, imag_count, b0_count, cinema=False):
+    text = (
+        f"{prefix}: {real_count} real frames and {imag_count} imaginary frames"
+        if prefix.startswith("Loaded")
+        else f"{prefix} {real_count} real frames and {imag_count} imaginary frames"
+    )
+    if b0_count:
+        text += f" and {b0_count} B0"
+    missing = []
+    if real_count <= 0:
+        missing.append("real")
+    if imag_count <= 0:
+        missing.append("imag")
+    if missing:
+        text += " (missing: " + ", ".join(missing) + ")"
+    elif cinema:
+        text += " for Cinema feature"
+    return text
+
+
+def _empty_import_detail(result):
+    parts = []
+    if result.missing:
+        parts.append("Not found: " + ", ".join(result.missing))
+    if result.skipped:
+        parts.append("Skipped unreadable: " + ", ".join(result.skipped))
+    if not parts:
+        return ""
+    return " " + " ".join(parts)

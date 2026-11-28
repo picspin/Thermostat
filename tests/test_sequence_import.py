@@ -65,6 +65,7 @@ def _write_dicom(
     te=10.0,
     b0=3.0,
     acquisition_time=None,
+    acquisition_datetime=None,
 ):
     stored = np.asarray(pixels)
     if stored.dtype.kind == "f":
@@ -104,6 +105,8 @@ def _write_dicom(
         dataset.RescaleIntercept = float(rescale_intercept)
     if acquisition_time is not None:
         dataset.AcquisitionTime = acquisition_time
+    if acquisition_datetime is not None:
+        dataset.AcquisitionDateTime = acquisition_datetime
     dataset.save_as(
         str(path),
         implicit_vr=False,
@@ -112,12 +115,14 @@ def _write_dicom(
     )
 
 
-def _write_nifti(path, array, te=10.0, b0=3.0):
+def _write_nifti(path, array, te=10.0, b0=3.0, note=None):
     image = sitk.GetImageFromArray(np.asarray(array), isVector=False)
     image.SetSpacing(tuple(1.0 for _ in range(image.GetDimension())))
-    note = f"TE={te};B0={b0}"
-    image.SetMetaData("ITK_FileNotes", note)
-    image.SetMetaData("aux_file", note[:24])
+    if note is None and te is not None and b0 is not None:
+        note = f"TE={te};B0={b0}"
+    if note:
+        image.SetMetaData("ITK_FileNotes", note)
+        image.SetMetaData("aux_file", note[:24])
     sitk.WriteImage(image, str(path))
 
 
@@ -150,6 +155,15 @@ def test_phase_scale_uses_rescale_and_refuses_raw_integers():
     assert np.allclose(phase_to_radians(np.array([[0.25, -0.5]]), None, "radians"), [0.25, -0.5])
     with pytest.raises(ValueError, match="not treated as radians"):
         phase_to_radians(np.array([[0, 1, 2, 3]]), None, "small-integers")
+    with pytest.raises(ValueError, match="0..4095"):
+        phase_to_radians(np.array([[-2048, 2047]]), None, "signed")
+
+    class _Wide:
+        RescaleSlope = 2.0
+        RescaleIntercept = 0.0
+
+    with pytest.raises(ValueError, match="outside"):
+        phase_to_radians(np.array([[0.0, 4.0]]), _Wide(), "wide")
 
 
 def test_real_imag_dicom_reaches_temperature(tmp_path):
@@ -412,3 +426,242 @@ def test_baseline_first_frame_is_compared_with_sequence_first_frame(tmp_path):
     assert len(controller.view.all_real_files) == 2
     assert controller.model.calculate_temperature(37.0) is True
     assert np.isfinite(controller.model.temperature_map).any()
+
+
+def test_single_letter_image_type_is_not_a_b0_map(tmp_path):
+    folder = Path(tmp_path)
+    _write_dicom(
+        folder / "frame_a",
+        _constant(40),
+        image_type=["ORIGINAL", "PRIMARY", "M"],
+        series_description="SWI MAGNITUDE MAP",
+        acquisition_time="090000",
+    )
+    _write_dicom(
+        folder / "frame_b",
+        _constant(2048),
+        image_type=["ORIGINAL", "PRIMARY", "P"],
+        series_description="SWI PHASE MAP",
+        acquisition_time="090000",
+    )
+    _write_dicom(
+        folder / "frame_c.dcm",
+        _constant(40),
+        image_type=["ORIGINAL", "PRIMARY"],
+        series_description="SWI MAGNITUDE MAP",
+    )
+
+    paired = import_sequences([str(folder / "frame_a"), str(folder / "frame_b")])
+    assert paired.b0_paths == []
+    assert paired.problems == []
+    assert len(paired.real_sources) == 1
+    phase = np.angle(paired.real_sources[0].array + 1j * paired.imag_sources[0].array)
+    expected = (2048 / 4095.0) * 2 * np.pi - np.pi
+    assert np.allclose(phase, expected)
+
+    described = import_sequences([str(folder / "frame_c.dcm")])
+    assert described.b0_paths == []
+    assert any("frame_c.dcm" in problem and "magnitude" in problem for problem in described.problems)
+
+    letters = Path(tmp_path) / "letters"
+    letters.mkdir()
+    _write_dicom(letters / "one", _constant(5), image_type=["ORIGINAL", "PRIMARY", "R"])
+    _write_dicom(letters / "two", _constant(6), image_type=["ORIGINAL", "PRIMARY", "I"])
+    native = import_sequences([str(letters)])
+    assert native.b0_paths == []
+    assert native.problems == []
+    assert len(native.real_sources) == 1 and len(native.imag_sources) == 1
+
+
+def test_partial_import_clears_stale_frames_and_scan_parameters(tmp_path):
+    first = Path(tmp_path) / "full"
+    first.mkdir()
+    _write_dicom(
+        first / "t0_real.dcm",
+        _constant(100),
+        image_type=["ORIGINAL", "PRIMARY", "REAL"],
+        acquisition_time="100000",
+        te=11,
+        b0=1.5,
+    )
+    _write_dicom(
+        first / "t0_imag.dcm",
+        _constant(0),
+        image_type=["ORIGINAL", "PRIMARY", "IMAGINARY"],
+        acquisition_time="100000",
+        te=11,
+        b0=1.5,
+    )
+    _write_dicom(
+        first / "t1_real.dcm",
+        _constant(80),
+        image_type=["ORIGINAL", "PRIMARY", "REAL"],
+        acquisition_time="100200",
+        te=11,
+        b0=1.5,
+    )
+    _write_dicom(
+        first / "t1_imag.dcm",
+        _constant(60),
+        image_type=["ORIGINAL", "PRIMARY", "IMAGINARY"],
+        acquisition_time="100200",
+        te=11,
+        b0=1.5,
+    )
+    controller = _controller()
+    controller.batch_load_dicom([str(first)])
+    assert controller.model.te == 11.0
+    assert controller.model.b0 == 1.5
+    assert np.allclose(controller.model.real2, 80)
+
+    baseline = Path(tmp_path) / "real_only"
+    baseline.mkdir()
+    _write_dicom(baseline / "only_real.dcm", _constant(7), image_type=["ORIGINAL", "PRIMARY", "REAL"])
+    controller.batch_load_dicom([str(baseline)], role="baseline")
+    assert np.allclose(controller.model.real1, 7)
+    assert controller.model.imag1 is None
+    assert np.allclose(controller.model.real2, 100)
+    assert any("missing: imag" in message for message in controller.view.statuses)
+    assert controller.model.calculate_temperature(37.0) is False
+
+    fresh = _controller()
+    fresh.batch_load_dicom([str(first)])
+    assert fresh.model.te == 11.0
+    # Time is the second axis.  A leading size-1 axis is the last NIfTI
+    # dimension and is dropped on write, so this shape stays 4D: one volume,
+    # component axis length 2.
+    bare = np.zeros((2, 1, 4, 4), dtype=np.float32)
+    bare[0, 0] = 3
+    bare[1, 0] = 4
+    nifti = Path(tmp_path) / "bare.nii.gz"
+    _write_nifti(nifti, bare, te=None, b0=None)
+    fresh.batch_load_dicom([str(nifti)], role="sequence")
+    assert fresh.model.te is None
+    assert fresh.model.b0 is None
+    assert np.allclose(fresh.model.real1, 3)
+    assert fresh.model.real2 is None
+    assert fresh.model.imag2 is None
+    assert fresh.model.calculate_temperature(37.0) is False
+
+
+def test_mixed_dicom_and_nifti_are_not_concatenated(tmp_path):
+    series = np.zeros((2, 2, 4, 4), dtype=np.float32)
+    series[0, 0] = 1
+    series[1, 0] = 2
+    nifti = Path(tmp_path) / "series.nii.gz"
+    _write_nifti(nifti, series)
+    _write_dicom(
+        Path(tmp_path) / "t0_real.dcm",
+        _constant(9),
+        image_type=["ORIGINAL", "PRIMARY", "REAL"],
+    )
+    _write_dicom(
+        Path(tmp_path) / "t0_imag.dcm",
+        _constant(0),
+        image_type=["ORIGINAL", "PRIMARY", "IMAGINARY"],
+    )
+    result = import_sequences([str(tmp_path)])
+    assert result.real_sources == []
+    assert result.imag_sources == []
+    text = " ".join(result.problems)
+    assert "series.nii.gz" in text and "t0_real.dcm" in text
+    assert "not combined" in text
+
+
+def test_unreadable_empty_and_missing_paths_are_named(tmp_path):
+    folder = Path(tmp_path) / "empty"
+    folder.mkdir()
+    controller = _controller()
+    controller.batch_load_dicom([str(folder)])
+    assert any("No DICOM or NIfTI" in message for message in controller.view.errors)
+
+    bad_nifti = Path(tmp_path) / "broken.nii.gz"
+    bad_nifti.write_bytes(b"not a nifti")
+    truncated = Path(tmp_path) / "truncated.dcm"
+    truncated.write_bytes(b"DICM" + b"\0" * 32)
+    result = import_sequences([str(bad_nifti), str(truncated), "/no/such/frame.dcm"])
+    assert "broken.nii.gz" in result.skipped
+    assert "truncated.dcm" in result.skipped
+    assert "frame.dcm" in result.missing
+    assert result.real_sources == []
+
+    controller.batch_load_dicom([str(bad_nifti), "/no/such/frame.dcm"])
+    assert any("Skipped unreadable: broken.nii.gz" in message for message in controller.view.statuses)
+    assert any("Not found: frame.dcm" in message for message in controller.view.statuses)
+    assert not any("Skipped unreadable: frame.dcm" in message for message in controller.view.statuses)
+
+
+def test_duplicate_path_is_imported_once_and_clocks_are_not_lexicographic(tmp_path):
+    folder = Path(tmp_path) / "clocks"
+    folder.mkdir()
+    _write_dicom(
+        folder / "late.dcm",
+        _constant(1),
+        image_type=["ORIGINAL", "PRIMARY", "REAL"],
+        acquisition_datetime="20261128100000",
+    )
+    _write_dicom(
+        folder / "early.dcm",
+        _constant(3),
+        image_type=["ORIGINAL", "PRIMARY", "REAL"],
+        acquisition_datetime="20261128090000",
+    )
+    _write_dicom(
+        folder / "time_only.dcm",
+        _constant(2),
+        image_type=["ORIGINAL", "PRIMARY", "REAL"],
+        acquisition_time="080000",
+    )
+    result = import_sequences([str(folder), str(folder / "early.dcm")])
+    assert [Path(path).name for path in result.real_sources] == [
+        "early.dcm",
+        "late.dcm",
+        "time_only.dcm",
+    ]
+
+
+def test_bad_nifti_note_does_not_drop_the_other_file(tmp_path):
+    good = np.zeros((2, 2, 4, 4), dtype=np.float32)
+    good[0, 0] = 10
+    good[0, 1] = 0
+    good[1, 0] = 0
+    good[1, 1] = 10
+    bad = np.zeros((2, 2, 4, 4), dtype=np.float32)
+    bad[0, 0] = 1
+    _write_nifti(Path(tmp_path) / "good.nii.gz", good)
+    _write_nifti(Path(tmp_path) / "bad.nii.gz", bad, note="TE=1.2.3;B0=3")
+    result = import_sequences([str(tmp_path)])
+    assert any("bad.nii.gz" in problem for problem in result.problems)
+    assert any(np.allclose(source.array, 10) for source in result.real_sources)
+    assert len(result.real_sources) == 4
+
+
+def test_nifti_keeps_real_imag_when_magnitude_is_also_present(tmp_path):
+    _write_nifti(Path(tmp_path) / "frame_real.nii.gz", np.full((1, 4, 4), 8, np.float32))
+    _write_nifti(Path(tmp_path) / "frame_imag.nii.gz", np.full((1, 4, 4), 2, np.float32))
+    _write_nifti(Path(tmp_path) / "frame_magnitude.nii.gz", np.full((1, 4, 4), 5, np.float32))
+    result = import_sequences([str(tmp_path)])
+    assert len(result.real_sources) == 1
+    assert np.allclose(result.real_sources[0].array, 8)
+    assert np.allclose(result.imag_sources[0].array, 2)
+    assert any("frame_magnitude.nii.gz" in problem for problem in result.problems)
+
+
+def test_shape_mismatch_does_not_calculate(tmp_path):
+    baseline = Path(tmp_path) / "baseline"
+    sequence = Path(tmp_path) / "sequence"
+    baseline.mkdir()
+    sequence.mkdir()
+    _write_dicom(baseline / "real.dcm", _constant(10, (4, 4)), image_type=["ORIGINAL", "PRIMARY", "REAL"])
+    _write_dicom(baseline / "imag.dcm", _constant(0, (4, 4)), image_type=["ORIGINAL", "PRIMARY", "IMAGINARY"])
+    _write_dicom(sequence / "real.dcm", _constant(8, (5, 6)), image_type=["ORIGINAL", "PRIMARY", "REAL"])
+    _write_dicom(sequence / "imag.dcm", _constant(1, (5, 6)), image_type=["ORIGINAL", "PRIMARY", "IMAGINARY"])
+    controller = _controller()
+    errors = []
+    controller.model.error_occurred.connect(errors.append)
+    controller.batch_load_dicom([str(sequence)])
+    controller.batch_load_dicom([str(baseline)], role="baseline")
+    assert controller.model.real1.shape == (4, 4)
+    assert controller.model.real2.shape == (5, 6)
+    assert controller.model.calculate_temperature(37.0) is False
+    assert any("Error calculating temperature" in message for message in errors)

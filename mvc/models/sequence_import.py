@@ -12,6 +12,7 @@ module still refuses a missing clock instead of inventing equal spacing.
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import date
 
 import numpy as np
 import pydicom
@@ -21,8 +22,14 @@ IMAGE_TYPE_TAG = (0x0008, 0x0008)
 COMPLEX_COMPONENT_TAG = (0x0008, 0x9208)
 ACQUISITION_DATETIME_TAG = (0x0008, 0x002A)
 
-# 0 and 4095 are the ends of a 12-bit phase code.  4096 is not the top code.
+# 0 and 4095 are the ends of an unsigned 12-bit phase code.
+# Dividing by 4095 maps code 4095 to exactly +π.  A vendor rescale of 2π/4096
+# maps 4095 to just under +π (about 0.00077 rad less).  That difference is
+# negligible for PRF temperature, and 4096 is not itself a stored code, so
+# the unsigned map uses 4095 on purpose.  Signed codes (−2048…2047) are
+# rejected rather than guessed.
 _PHASE_CODE_MAX = 4095.0
+_RADIAN_LIMIT = float(np.pi) + 1e-3
 _COMPONENT_TOKENS = (
     ("PHASE", "phase"),
     ("IMAGINARY", "imaginary"),
@@ -31,6 +38,14 @@ _COMPONENT_TOKENS = (
     ("MAG", "magnitude"),
     ("REAL", "real"),
 )
+# DICOM MR Image Type value 3 (and the same letters in Complex Image
+# Component): Siemens and Philips write M/P/R/I, not the full words.
+_MR_VALUE3 = {
+    "M": "magnitude",
+    "P": "phase",
+    "R": "real",
+    "I": "imaginary",
+}
 
 
 class LoadedFrame:
@@ -84,6 +99,7 @@ class ImportResult:
     imag_sources: list = field(default_factory=list)
     b0_paths: list = field(default_factory=list)
     skipped: list = field(default_factory=list)
+    missing: list = field(default_factory=list)
     problems: list = field(default_factory=list)
 
 
@@ -92,7 +108,7 @@ class _DicomItem:
     path: str
     filename: str
     kind: str
-    sort_key: str
+    sort_key: tuple
     order: int
     image_type: str
     component: str
@@ -108,28 +124,30 @@ def import_sequences(paths, component_pair=None):
 
     result = ImportResult()
     files, missing = _collect_files(paths)
-    result.skipped.extend(missing)
+    result.missing.extend(missing)
     dicom_items = []
     nifti_real = []
     nifti_imag = []
     loose = []
+    nifti_names = []
     for order, path in enumerate(files):
         if _is_nifti(path):
+            before = len(nifti_real) + len(nifti_imag) + len(loose)
             _consume_nifti(
                 path, component_pair, nifti_real, nifti_imag, loose, result
             )
+            if len(nifti_real) + len(nifti_imag) + len(loose) > before:
+                nifti_names.append(os.path.basename(str(path)))
             continue
         try:
             dataset = pydicom.dcmread(str(path), stop_before_pixels=True)
         except Exception:
             result.skipped.append(os.path.basename(str(path)))
             continue
+        filename = os.path.basename(str(path))
         image_type, component = _dicom_type_text(dataset)
-        kind = _kind_from_text(image_type + " " + component)
-        if kind is None:
-            kind = _kind_from_text(os.path.basename(str(path)))
-        if kind is None and _looks_like_b0(dataset, os.path.basename(str(path))):
-            kind = "b0"
+        description = getattr(dataset, "SeriesDescription", "") or ""
+        kind = _classify_dicom(image_type, component, filename, description)
         if kind is None:
             result.problems.append(
                 _unrecognized_message(os.path.basename(str(path)), image_type, component)
@@ -156,18 +174,34 @@ def import_sequences(paths, component_pair=None):
         result.problems.extend(problems)
         nifti_real.extend(paired_real)
         nifti_imag.extend(paired_imag)
+    if (nifti_real or nifti_imag) and (real_paths or imag_paths):
+        dicom_names = ", ".join(
+            sorted({item.filename for item in dicom_items if item.kind != "b0"})
+        )
+        result.problems.append(
+            f"DICOM ({dicom_names}) and NIfTI ({', '.join(nifti_names)}) were "
+            "selected together. They were not combined into one time series. "
+            "Import one source at a time."
+        )
+        return result
     result.real_sources = nifti_real + real_paths
     result.imag_sources = nifti_imag + imag_paths
     return result
 
 
 def phase_to_radians(pixels, dataset, filename):
-    """Phase in radians.  Raw 12-bit integers are not left as radians.
+    """Phase in radians.  Raw integer codes are not left as radians.
 
-    A Rescale Slope / Intercept other than 1 and 0 is the phase in radians.
-    Without that scale, integer codes whose range sits inside 0–4095 and
-    above π are mapped from 0 → −π and 4095 → π.  Floats already inside
-    [−π, π] are kept.  Anything else raises; it is not treated as radians.
+    A Rescale Slope / Intercept other than 1 and 0 is applied and then
+    accepted only when the result is still inside [−π, π].  A slope that
+    leaves values far outside that range is rejected, not wrapped by cos/sin.
+
+    Without that scale, unsigned integer codes inside 0–4095 (and above π)
+    map with ``code / 4095 * 2π − π``, so 0 → −π and 4095 → +π.  This is not
+    the vendor ``2π/4096`` rescale: that one puts code 4095 about 0.00077 rad
+    under +π.  The difference does not matter for PRF temperature.  Signed
+    12-bit codes (−2048…2047) are not mapped.  Floats already inside
+    [−π, π] are kept.
     """
 
     values = np.asarray(pixels, dtype=float)
@@ -176,7 +210,14 @@ def phase_to_radians(pixels, dataset, filename):
     if present:
         values = values * slope + intercept
     if not identity:
-        return values
+        if _within_radians(values):
+            return values
+        low = float(np.min(values)) if values.size else float("nan")
+        high = float(np.max(values)) if values.size else float("nan")
+        raise ValueError(
+            f"{filename}: rescaled phase range {low:g}..{high:g} is outside "
+            "[-pi, pi]. Rescale Slope/Intercept was not treated as radians."
+        )
     if _integer_like(values):
         if values.size == 0:
             return values
@@ -186,11 +227,10 @@ def phase_to_radians(pixels, dataset, filename):
             return (values / _PHASE_CODE_MAX) * (2.0 * np.pi) - np.pi
         raise ValueError(
             f"{filename}: phase codes {low:g}..{high:g} are integers and have "
-            "no Rescale Slope/Intercept. Raw integers are not treated as radians."
+            "no Rescale Slope/Intercept. Only unsigned codes 0..4095 are "
+            "mapped to -pi..pi. Raw integers are not treated as radians."
         )
-    if values.size == 0 or (
-        np.all(np.isfinite(values)) and float(np.max(np.abs(values))) <= np.pi + 1e-3
-    ):
+    if _within_radians(values):
         return values
     low = float(np.min(values)) if values.size else float("nan")
     high = float(np.max(values)) if values.size else float("nan")
@@ -208,7 +248,11 @@ def _consume_nifti(path, component_pair, nifti_real, nifti_imag, loose, result):
     except Exception:
         result.skipped.append(filename)
         return
-    header = _nifti_header(image)
+    try:
+        header = _nifti_header(image)
+    except ValueError as exc:
+        result.problems.append(f"{filename}: {exc}")
+        header = None
     try:
         if np.iscomplexobj(array) or getattr(array, "ndim", 0) == 4:
             frames = _frames_from_series(array, filename, component_pair, header)
@@ -278,7 +322,14 @@ def _complex_volumes(array, filename):
 
 
 def _time_major_components(array, filename):
-    """Return (time, 2, row, col).  Axis length 2 is the component axis."""
+    """Return (time, 2, row, col).  Axis length 2 is the component axis.
+
+    SimpleITK's array is (time, component, row, col) when the file was
+    written that way.  If axis 1 has length 2 it wins, even when axis 0 is
+    also 2.  A 2-volume × 2-slice magnitude series with shape (2, 2, H, W)
+    is therefore read as two real/imag frames, not two slices.  Name the
+    file or pass ``component_pair`` when that default is wrong.
+    """
 
     if array.ndim != 4:
         raise ValueError(
@@ -373,11 +424,12 @@ def _append_named_nifti(named, real_sources, imag_sources):
     mags = [item for item in named if item["kind"] == "magnitude"]
     phases = [item for item in named if item["kind"] == "phase"]
     if (reals or imags) and (mags or phases):
-        names = ", ".join(item["filename"] for item in named)
+        names = ", ".join(item["filename"] for item in mags + phases)
         problems.append(
-            f"{names}: NIfTI import mixes real/imag with magnitude/phase. "
-            "Import one pair type at a time."
+            f"{names}: magnitude/phase NIfTI was not mixed into a "
+            "real/imaginary series."
         )
+        _zip_components(reals, imags, "real_imag", real_sources, imag_sources, problems)
         return problems
     if reals or imags:
         _zip_components(reals, imags, "real_imag", real_sources, imag_sources, problems)
@@ -479,29 +531,39 @@ def _magnitude_phase_sources(mags, phases, problems):
 
 
 def _sort_items(items):
-    decorated = []
-    for index, item in enumerate(items):
-        missing = item.sort_key is None
-        decorated.append((missing, item.sort_key or "", item.order, index, item))
-    decorated.sort()
-    return [item for _, _, _, _, item in decorated]
+    """Dated clocks, then time-of-day clocks, then files with no clock."""
+    return sorted(items, key=lambda item: (item.sort_key, item.order))
 
 
 def _dicom_sort_key(dataset):
-    text = _tag_text(dataset, ACQUISITION_DATETIME_TAG)
-    if text:
-        return text
-    if getattr(dataset, "AcquisitionDateTime", None):
-        return str(dataset.AcquisitionDateTime)
-    acquisition = getattr(dataset, "AcquisitionTime", None)
-    if acquisition:
-        date = getattr(dataset, "AcquisitionDate", None)
-        return f"{date or ''}{acquisition}"
-    series_time = getattr(dataset, "SeriesTime", None)
-    if series_time:
-        series_date = getattr(dataset, "SeriesDate", None)
-        return f"{series_date or ''}{series_time}"
-    return None
+    """Sort key ``(group, seconds)``.  Group 0 is dated, 1 is time-only, 2 is missing.
+
+    AcquisitionDateTime (YYYYMMDDHHMMSS) and AcquisitionDate+AcquisitionTime
+    become seconds from a date ordinal.  A bare AcquisitionTime is seconds
+    from midnight and sorts after every dated clock, not by string order
+    against a YYYYMMDD prefix.  SeriesDate/SeriesTime are the last fallback.
+    Unparseable clocks sort last and do not fail the import.
+    """
+
+    datetime_text = _tag_text(dataset, ACQUISITION_DATETIME_TAG)
+    if not datetime_text and getattr(dataset, "AcquisitionDateTime", None):
+        datetime_text = str(dataset.AcquisitionDateTime)
+    absolute = _parse_dt_seconds(datetime_text)
+    if absolute is not None:
+        return (0, absolute)
+    dated = _dated_clock(
+        getattr(dataset, "AcquisitionDate", None),
+        getattr(dataset, "AcquisitionTime", None),
+    )
+    if dated is not None:
+        return dated
+    dated = _dated_clock(
+        getattr(dataset, "SeriesDate", None),
+        getattr(dataset, "SeriesTime", None),
+    )
+    if dated is not None:
+        return dated
+    return (2, 0.0)
 
 
 def _unrecognized_message(filename, image_type, component):
@@ -536,23 +598,60 @@ def _tag_text(dataset, tag):
     return str(value).strip()
 
 
-def _kind_from_text(text):
+def _tokens(text):
     tokens = set(re.split(r"[^A-Z0-9]+", (text or "").upper()))
     tokens.discard("")
+    return tokens
+
+
+def _kind_from_text(text):
+    tokens = _tokens(text)
     for token, kind in _COMPONENT_TOKENS:
         if token in tokens:
             return kind
     return None
 
 
+def _kind_from_value3(image_type, component):
+    """Single-letter MR Image Type value 3, or a one-letter complex component.
+
+    Filenames are not checked.  ``ORIGINAL\\PRIMARY\\M`` is magnitude;
+    ``MPR`` is not, because the third value must be exactly M, P, R, or I.
+    """
+
+    parts = [part for part in re.split(r"[^A-Za-z0-9]+", image_type or "") if part]
+    if len(parts) >= 3 and parts[2].upper() in _MR_VALUE3:
+        return _MR_VALUE3[parts[2].upper()]
+    component_text = (component or "").strip().upper()
+    if component_text in _MR_VALUE3:
+        return _MR_VALUE3[component_text]
+    return None
+
+
+def _classify_dicom(image_type, component, filename, description):
+    """Component first, including M/P/R/I.  B0 is only a whole-word fallback.
+
+    ``MAP`` inside a magnitude or phase description must not win.  A
+    description that itself says MAGNITUDE or PHASE is that component even
+    when Image Type is empty.  ``MAP`` matches only as its own token, so
+    ``MAPPING`` is not a B0 map.
+    """
+
+    tagged = f"{image_type} {component}"
+    kind = _kind_from_text(tagged)
+    if kind is None:
+        kind = _kind_from_value3(image_type, component)
+    if kind is None:
+        kind = _kind_from_text(filename)
+    if kind is None:
+        kind = _kind_from_text(description)
+    if kind is None and _tokens(f"{description} {filename}") & {"B0", "FIELD", "MAP"}:
+        kind = "b0"
+    return kind
+
+
 def _nifti_file_kind(filename):
     return _kind_from_text(filename)
-
-
-def _looks_like_b0(dataset, filename):
-    description = getattr(dataset, "SeriesDescription", "") or ""
-    blob = f"{description} {filename}".upper()
-    return any(token in blob for token in ("B0", "FIELD", "MAP"))
 
 
 def _rescale(dataset):
@@ -579,6 +678,14 @@ def _integer_like(values):
     if values.size == 0 or not np.all(np.isfinite(values)):
         return False
     return bool(np.all(np.abs(values - np.round(values)) <= 1e-6))
+
+
+def _within_radians(values):
+    if values.size == 0:
+        return True
+    if not np.all(np.isfinite(values)):
+        return False
+    return float(np.max(np.abs(values))) <= _RADIAN_LIMIT
 
 
 def _as_2d(array, filename):
@@ -621,7 +728,12 @@ def _parse_te_b0(text):
     for match in re.finditer(
         r"\b(TE|B0)\s*[:=]\s*([-+0-9.eE]+)", text, flags=re.IGNORECASE
     ):
-        value = float(match.group(2))
+        try:
+            value = float(match.group(2))
+        except ValueError as exc:
+            raise ValueError(
+                f"NIfTI note {match.group(0)!r} is not a TE or B0 number."
+            ) from exc
         if match.group(1).upper() == "TE" and te is None:
             te = value
         elif match.group(1).upper() == "B0" and b0 is None:
@@ -632,6 +744,15 @@ def _parse_te_b0(text):
 def _collect_files(paths):
     files = []
     missing = []
+    seen = set()
+
+    def add_file(path):
+        key = os.path.normcase(os.path.abspath(path))
+        if key in seen:
+            return
+        seen.add(key)
+        files.append(path)
+
     for raw in paths or []:
         if raw is None:
             continue
@@ -640,13 +761,81 @@ def _collect_files(paths):
             for root, dirs, names in os.walk(path):
                 dirs.sort()
                 for name in sorted(names):
-                    files.append(os.path.join(root, name))
+                    add_file(os.path.join(root, name))
             continue
         if os.path.isfile(path):
-            files.append(path)
+            add_file(path)
             continue
         missing.append(os.path.basename(path) or path)
     return files, missing
+
+
+def _parse_tm_seconds(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    fraction = 0.0
+    whole = text
+    if "." in text:
+        whole, frac = text.split(".", 1)
+        if frac == "" or not frac.isdigit():
+            return None
+        fraction = float("0." + frac)
+    if not whole.isdigit() or len(whole) not in (2, 4, 6):
+        return None
+    hour = int(whole[0:2])
+    minute = int(whole[2:4]) if len(whole) >= 4 else 0
+    second = int(whole[4:6]) if len(whole) == 6 else 0
+    if hour > 23 or minute > 59 or second >= 61:
+        return None
+    return hour * 3600.0 + minute * 60.0 + second + fraction
+
+
+def _parse_da_ordinal(value):
+    text = str(value or "").strip()
+    if len(text) != 8 or not text.isdigit():
+        return None
+    try:
+        return date(int(text[0:4]), int(text[4:6]), int(text[6:8])).toordinal()
+    except ValueError:
+        return None
+
+
+def _parse_dt_seconds(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    fraction = 0.0
+    whole = text
+    if "." in text:
+        whole, frac = text.split(".", 1)
+        if frac and not frac.isdigit():
+            return None
+        if frac:
+            fraction = float("0." + frac)
+    if not whole.isdigit() or len(whole) < 8 or len(whole) > 14 or len(whole) % 2 != 0:
+        return None
+    ordinal = _parse_da_ordinal(whole[0:8])
+    if ordinal is None:
+        return None
+    seconds = 0.0
+    if len(whole) > 8:
+        seconds = _parse_tm_seconds(whole[8:])
+        if seconds is None:
+            return None
+    return ordinal * 86400.0 + seconds + fraction
+
+
+def _dated_clock(date_value, time_value):
+    if not date_value and not time_value:
+        return None
+    seconds = _parse_tm_seconds(time_value)
+    if seconds is None:
+        return None
+    ordinal = _parse_da_ordinal(date_value) if date_value else None
+    if ordinal is None:
+        return (1, seconds)
+    return (0, ordinal * 86400.0 + seconds)
 
 
 def _is_nifti(path):
