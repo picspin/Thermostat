@@ -1,11 +1,13 @@
 """Headless checks for the sequence workflow on the main window.
 
 These tests use fake views or an offscreen QApplication.  They do not
-require a display server and do not open the full thermometry window.
+require a display server.  One test constructs the real window offscreen
+to pin the initial value of sequence_busy; the rest do not.
 """
 
 from pathlib import Path
 
+from PyQt5.QtWidgets import QApplication
 from pydicom.dataset import Dataset, FileDataset
 from pydicom.uid import ExplicitVRLittleEndian, generate_uid
 
@@ -29,6 +31,7 @@ class _StatusView:
         self.frame_counts = None
         self.all_real_files = []
         self.all_imag_files = []
+        self.sequence_busy = False
 
     def update_status(self, message, timeout_ms=5000):
         self.statuses.append(message)
@@ -540,3 +543,26 @@ def test_running_cinema_refuses_reload_and_recalculation(monkeypatch):
     assert view.load_sequence_button.enabled is True
     # Motion correction had already disabled Calculate; Cinema must not turn it back on.
     assert view.calc_button.enabled is False
+
+
+_QT_APP = None
+
+
+def _app():
+    """Keep one QApplication.  A temporary one is destroyed immediately."""
+    global _QT_APP
+    if QApplication.instance() is None:
+        _QT_APP = QApplication([])
+    elif _QT_APP is None:
+        _QT_APP = QApplication.instance()
+    return _QT_APP
+
+
+def test_sequence_busy_starts_false():
+    """A window that has never run Cinema can be read without getattr."""
+    _app()
+    view = ThermometryView()
+    try:
+        assert view.sequence_busy is False
+    finally:
+        view.close()

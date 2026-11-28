@@ -144,6 +144,7 @@ class ThermometryView(QMainWindow):
         # 存储用于Cinema和Thermostat的数据
         self.all_real_files = []
         self.all_imag_files = []
+        self.sequence_busy = False
         self.temperature_sequence = []
         
         self.setup_connections()
@@ -885,7 +886,7 @@ class ThermometryView(QMainWindow):
             
     def on_batch_load_folders(self):
         """使用自定义对话框批量加载多个文件夹"""
-        if getattr(self, "sequence_busy", False):
+        if self.sequence_busy:
             self.show_error(
                 "A temperature sequence is already running. "
                 "Wait for it to finish or cancel it before loading another sequence."

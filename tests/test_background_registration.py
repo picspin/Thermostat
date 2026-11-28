@@ -18,6 +18,7 @@ class FakeView:
         self.errors = []
         self.temperature_updates = []
         self.status_timeouts = []
+        self.sequence_busy = False
 
     def update_status(self, message, timeout_ms=5000):
         self.statuses.append(message)
