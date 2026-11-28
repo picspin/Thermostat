@@ -144,6 +144,7 @@ class ThermometryView(QMainWindow):
         # 存储用于Cinema和Thermostat的数据
         self.all_real_files = []
         self.all_imag_files = []
+        self.sequence_busy = False
         self.temperature_sequence = []
         
         self.setup_connections()
