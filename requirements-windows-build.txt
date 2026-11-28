@@ -1,4 +1,12 @@
 # Packager pin for the Windows release job.
 # Application dependencies stay in requirements.txt.
-# Do not replace this with a Linux pip freeze; those wheels are not a Windows lockfile.
+# The release job installs requirements-windows.lock (this file plus
+# requirements.txt, CPython 3.11, x86_64 Windows, hashes required).
+# Regenerate after changing either input:
+#   uv pip compile requirements.txt requirements-windows-build.txt \
+#     --python-version 3.11 \
+#     --python-platform x86_64-pc-windows-msvc \
+#     --generate-hashes --only-binary :all: \
+#     -o requirements-windows.lock
+# Do not replace the lock with a Linux pip freeze.
 pyinstaller==6.22.3
