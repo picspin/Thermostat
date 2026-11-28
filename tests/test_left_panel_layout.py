@@ -70,6 +70,19 @@ def _assert_fully_in_viewport(widget, viewport):
     assert right <= viewport.width() + _SLACK, (name, right, viewport.width())
 
 
+def _scroll_into_view(scroll, widget):
+    """Move the vertical bar so widget lies fully inside the viewport."""
+    bar = scroll.verticalScrollBar()
+    top, bottom, _, _ = _box_in(widget, scroll.widget())
+    viewport_h = scroll.viewport().height()
+    target = top
+    if bottom - target > viewport_h:
+        target = max(0, bottom - viewport_h)
+    bar.setValue(int(max(bar.minimum(), min(bar.maximum(), target))))
+    _QT_APP.processEvents()
+    return bar.value()
+
+
 def _assert_visible_without_scrolling(view, scroll, controls):
     bar = scroll.verticalScrollBar()
     assert bar.value() == 0
@@ -95,6 +108,10 @@ def test_left_panel_scroll_keeps_window_controls_visible():
             if splitter.widget(0) is scroll
         ]
         assert len(splitters) == 1
+        splitter = splitters[0]
+        # Left column cannot be dragged to 0; the image pane still can.
+        assert splitter.isCollapsible(0) is False
+        assert splitter.isCollapsible(1) is True
 
         controls = (
             view.window_center_input,
@@ -170,6 +187,13 @@ def test_left_panel_scroll_keeps_window_controls_visible():
         )
         if content_height > viewport.height() + _SLACK:
             assert scroll.verticalScrollBar().maximum() > 0
+        # A scrollbar range is not enough: scrolling to the Window group
+        # must actually put the three controls in the viewport.
+        assert _scroll_into_view(scroll, window_group) > 0
+        for widget in controls:
+            assert widget.isEnabled()
+            assert widget.height() >= 20
+            _assert_fully_in_viewport(widget, scroll.viewport())
 
         for name in (
             "load_real1_button",

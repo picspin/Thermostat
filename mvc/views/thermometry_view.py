@@ -465,9 +465,13 @@ class ThermometryView(QMainWindow):
         
         # 添加分隔器
         splitter = QSplitter(Qt.Horizontal)
-        splitter.setChildrenCollapsible(False)
         splitter.addWidget(left_scroll)
         splitter.addWidget(right_panel)
+        # Keep only the control column from being dragged to size 0.
+        # setChildrenCollapsible(False) would also freeze the image pane;
+        # setCollapsible is per index, so the right pane can still collapse.
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, True)
         splitter.setSizes([340, 860])  # Set initial sizes
         main_vertical_layout.addWidget(splitter)
         
@@ -483,6 +487,12 @@ class ThermometryView(QMainWindow):
 
     def _freeze_left_panel_minimum(self):
         """Floor the inner column so a short viewport scrolls instead of flattening rows.
+
+        The minimum height is a snapshot of the layout's totalMinimumSize.
+        Nothing adds widgets to this column after the window is shown.
+        showEvent refreshes the floor on show only. If controls are added
+        to the left column later, call this again after they are in the
+        layout; otherwise the new rows stay clipped until the next show.
 
         The scroll area is widened to the layout's minimum width plus the
         vertical scrollbar, so a row of buttons is fully visible instead of
