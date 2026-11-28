@@ -23,14 +23,14 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-windows-build.txt
+          cache-dependency-path: requirements-windows.lock
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt -r requirements-windows-build.txt
+          # Hash-locked CPython 3.11 / win_amd64 resolution.
+          # requirements.txt stays open for local development and tests.
+          pip install --require-hashes -r requirements-windows.lock
 
       - name: Build with PyInstaller
         run: |
@@ -253,7 +253,6 @@ jobs:
             ## 重要说明
 
             - ⚠️ **本版本没有监管认证，不能当成治疗终点。**
-            - 这一版包含已合并的腹部、头部、关节运动校正预设，以及主界面上的序列加载。
             - Windows 构建产物未签名。首次运行 `MR_Thermometry.exe` 时，Windows SmartScreen 可能提示“Windows 已保护你的电脑”。这是未签名下载文件的系统行为，不是安装失败。
             - macOS DMG（`MR_Thermometry-macos-arm64.dmg`）未签名，也没有公证。第一次打开会被 Gatekeeper 拦住。这不是安装失败。该包只含 Apple Silicon arm64，不是通用二进制，不能在 Intel Mac 上运行。
 
