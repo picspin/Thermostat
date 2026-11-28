@@ -125,7 +125,7 @@ def test_cinema_without_a_sequence_names_the_missing_kind():
     view.all_imag_files = []
 
     assert view._sequence_ready_for_cinema() is False
-    assert "Load DICOM Sequence" in view.errors[-1]
+    assert "Load Sequence" in view.errors[-1]
     assert "Missing: imag" in view.errors[-1]
 
     view.all_real_files = []
@@ -421,7 +421,7 @@ def test_cinema_names_a_missing_kind_without_opening_a_dialog():
 
     controller.generate_cinema()
 
-    assert "Load DICOM Sequence" in view.errors[-1]
+    assert "Load Sequence" in view.errors[-1]
     assert "Missing: imag" in view.errors[-1]
 
 

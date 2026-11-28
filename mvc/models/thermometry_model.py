@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import math
 from scipy.ndimage import zoom
 from PyQt5.QtCore import QObject, pyqtSignal
+from mvc.models.sequence_import import LoadedFrame
 
 class ThermometryModel(QObject):
     # Define signals
@@ -144,55 +145,45 @@ class ThermometryModel(QObject):
         self.dicom_header_info += info
 
     def load_real1_dicom(self, file_path):
-        """Load first real DICOM image."""
-        try:
-            ds = pydicom.dcmread(file_path)
-            self.real1 = ds.pixel_array.astype(float)
-            self._invalidate_registration()
-            self._extract_dicom_parameters(ds)
-            self._update_header_info(ds, "Real 1")
-            return True
-        except Exception as e:
-            print(f"Error loading Real 1 DICOM: {e}")
-            return False
+        """Load first real image.  A path is DICOM; a LoadedFrame is already decoded."""
+        return self._load_component("real1", file_path, "Real 1")
 
     def load_imag1_dicom(self, file_path):
-        """Load first imaginary DICOM image."""
-        try:
-            ds = pydicom.dcmread(file_path)
-            self.imag1 = ds.pixel_array.astype(float)
-            self._invalidate_registration()
-            self._extract_dicom_parameters(ds)
-            self._update_header_info(ds, "Imaginary 1")
-            return True
-        except Exception as e:
-            print(f"Error loading Imaginary 1 DICOM: {e}")
-            return False
+        """Load first imaginary image.  A path is DICOM; a LoadedFrame is already decoded."""
+        return self._load_component("imag1", file_path, "Imaginary 1")
 
     def load_real2_dicom(self, file_path):
-        """Load second real DICOM image."""
-        try:
-            ds = pydicom.dcmread(file_path)
-            self.real2 = ds.pixel_array.astype(float)
-            self._invalidate_registration()
-            self._extract_dicom_parameters(ds)
-            self._update_header_info(ds, "Real 2")
-            return True
-        except Exception as e:
-            print(f"Error loading Real 2 DICOM: {e}")
-            return False
+        """Load second real image.  A path is DICOM; a LoadedFrame is already decoded."""
+        return self._load_component("real2", file_path, "Real 2")
 
     def load_imag2_dicom(self, file_path):
-        """Load second imaginary DICOM image."""
+        """Load second imaginary image.  A path is DICOM; a LoadedFrame is already decoded."""
+        return self._load_component("imag2", file_path, "Imaginary 2")
+
+    def _load_component(self, attr, source, label):
+        """Store one complex component and refresh TE / B0 when the header has them."""
         try:
-            ds = pydicom.dcmread(file_path)
-            self.imag2 = ds.pixel_array.astype(float)
+            if isinstance(source, LoadedFrame):
+                setattr(self, attr, np.array(source.array, dtype=float, copy=True))
+                self._invalidate_registration()
+                header = source.dataset
+                if header is not None and (
+                    getattr(header, "EchoTime", None) is not None
+                    or getattr(header, "MagneticFieldStrength", None) is not None
+                ):
+                    self._extract_dicom_parameters(header)
+                    self._update_header_info(header, label)
+                elif header is not None and getattr(header, "PixelSpacing", None) is not None:
+                    self._remember_pixel_spacing(header)
+                return True
+            ds = pydicom.dcmread(source)
+            setattr(self, attr, ds.pixel_array.astype(float))
             self._invalidate_registration()
             self._extract_dicom_parameters(ds)
-            self._update_header_info(ds, "Imaginary 2")
+            self._update_header_info(ds, label)
             return True
         except Exception as e:
-            print(f"Error loading Imaginary 2 DICOM: {e}")
+            print(f"Error loading {label} DICOM: {e}")
             return False
 
     def load_b0_map(self, file_path):

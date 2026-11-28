@@ -3,7 +3,14 @@
 Uses the offscreen Qt platform from conftest.py. No visible display server.
 """
 
-from PyQt5.QtWidgets import QApplication, QGroupBox, QLabel, QScrollArea, QSplitter
+from PyQt5.QtWidgets import (
+    QApplication,
+    QGroupBox,
+    QLabel,
+    QPushButton,
+    QScrollArea,
+    QSplitter,
+)
 
 from mvc.views.thermometry_view import ThermometryView
 
@@ -195,8 +202,21 @@ def test_left_panel_scroll_keeps_window_controls_visible():
             assert widget.height() >= 20
             _assert_fully_in_viewport(widget, scroll.viewport())
 
+        button_text = [button.text() for button in view.findChildren(QPushButton)]
+        assert "Load Baseline Sequence" in button_text
+        assert "Load Sequence" in button_text
+        assert "Load B0 Map DICOM" in button_text
+        for removed in (
+            "Load 1st Real DICOM",
+            "Load 1st Imaginary DICOM",
+            "Load 2nd Real DICOM",
+            "Load 2nd Imaginary DICOM",
+        ):
+            assert removed not in button_text
+
         for name in (
-            "load_real1_button",
+            "load_baseline_button",
+            "load_sequence_button",
             "calc_button",
             "cinema_button",
             "coarse_liver_checkbox",

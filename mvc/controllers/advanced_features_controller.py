@@ -72,7 +72,7 @@ class AdvancedFeaturesController:
     def generate_cinema(self):
         """Generate a temperature map movie from sequence data."""
         try:
-            # Check if we have sequence files from Load DICOM Sequence.
+            # Check if we have sequence files from Load Sequence.
             real_files = getattr(self.view, "all_real_files", None) or []
             imag_files = getattr(self.view, "all_imag_files", None) or []
             if not real_files or not imag_files:
@@ -82,7 +82,7 @@ class AdvancedFeaturesController:
                 if not imag_files:
                     missing.append("imag")
                 self.view.show_error(
-                    "No sequence data available. Please use 'Load DICOM Sequence' first. "
+                    "No sequence data available. Please use 'Load Sequence' first. "
                     "Missing: " + ", ".join(missing) + "."
                 )
                 return
@@ -184,7 +184,7 @@ class AdvancedFeaturesController:
         a Calculate button that motion correction had already disabled.
         """
         self.view.sequence_busy = bool(busy)
-        names = ("load_sequence_button", "calc_button")
+        names = ("load_baseline_button", "load_sequence_button", "calc_button")
         if busy:
             saved = {}
             for name in names:

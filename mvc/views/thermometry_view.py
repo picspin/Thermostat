@@ -102,11 +102,8 @@ class ROIManager:
 
 
 class ThermometryView(QMainWindow):
-    # Define signals for UI events
-    load_real1_signal = pyqtSignal(str)
-    load_imag1_signal = pyqtSignal(str)
-    load_real2_signal = pyqtSignal(str)
-    load_imag2_signal = pyqtSignal(str)
+    # Define signals for UI events.  Real/imag frames arrive through the
+    # baseline and sequence imports, not four single-file signals.
     load_b0_map_signal = pyqtSignal(str)
     calculate_signal = pyqtSignal(float, bool, bool, bool)  # Added motion correction
     reset_signal = pyqtSignal()
@@ -141,9 +138,14 @@ class ThermometryView(QMainWindow):
         else:
             print(f"Icon not found at: {icon_path}")
         
-        # 存储用于Cinema和Thermostat的数据
+        # Cinema uses the sequence lists.  Two-frame temperature prefers the
+        # baseline lists when the user imported a separate reference.
         self.all_real_files = []
         self.all_imag_files = []
+        self.baseline_real_files = []
+        self.baseline_imag_files = []
+        self.import_role = "sequence"
+        self.import_component_pair = None
         self.temperature_sequence = []
         
         self.setup_connections()
@@ -172,37 +174,34 @@ class ThermometryView(QMainWindow):
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         
-        # Two-frame temperature still uses the four single-file loads.
+        # Two imports replace the four single-file real/imag buttons.
+        # Window level stays in its own group below this one.
         dicom_group = QGroupBox("Two-frame temperature")
         dicom_layout = QVBoxLayout()
         two_frame_hint = QLabel(
-            "Next: load the four DICOMs below, set options, then "
-            "Calculate Temperature Change."
+            "Load a baseline sequence and a sequence. Temperature compares "
+            "their first frames. B0 is optional."
         )
         two_frame_hint.setWordWrap(True)
         dicom_layout.addWidget(two_frame_hint)
-        
-        # 保留原有的单独加载按钮（为了向后兼容性）
-        load_real1_layout = QHBoxLayout()
-        self.load_real1_button = QPushButton('Load 1st Real DICOM', self)
-        self.load_real1_button.clicked.connect(self.on_load_real1)
-        load_real1_layout.addWidget(self.load_real1_button)
-        self.load_imag1_button = QPushButton('Load 1st Imaginary DICOM', self)
-        self.load_imag1_button.clicked.connect(self.on_load_imag1)
-        load_real1_layout.addWidget(self.load_imag1_button)
-        dicom_layout.addLayout(load_real1_layout)
-        
-        # Load 2nd Real/Imag Buttons
-        load_real2_layout = QHBoxLayout()
-        self.load_real2_button = QPushButton('Load 2nd Real DICOM', self)
-        self.load_real2_button.clicked.connect(self.on_load_real2)
-        load_real2_layout.addWidget(self.load_real2_button)
-        self.load_imag2_button = QPushButton('Load 2nd Imaginary DICOM', self)
-        self.load_imag2_button.clicked.connect(self.on_load_imag2)
-        load_real2_layout.addWidget(self.load_imag2_button)
-        dicom_layout.addLayout(load_real2_layout)
-        
-        # B0 Map Button
+
+        self.load_baseline_button = QPushButton('Load Baseline Sequence', self)
+        self.load_baseline_button.setToolTip(
+            'Reference series (the old first frame). DICOM folders, '
+            'extensionless DICOM, and .nii/.nii.gz.'
+        )
+        self.load_baseline_button.clicked.connect(self.on_load_baseline)
+        dicom_layout.addWidget(self.load_baseline_button)
+
+        self.load_sequence_button = QPushButton('Load Sequence', self)
+        self.load_sequence_button.setToolTip(
+            'Series to compare or play. Two-frame uses its first frame. '
+            'Cinema and CEM43 use every frame in time order; the first is '
+            'the reference. Same files as the baseline import.'
+        )
+        self.load_sequence_button.clicked.connect(self.on_load_sequence)
+        dicom_layout.addWidget(self.load_sequence_button)
+
         self.load_b0_button = QPushButton('Load B0 Map DICOM', self)
         self.load_b0_button.clicked.connect(self.on_load_b0_map)
         dicom_layout.addWidget(self.load_b0_button)
@@ -319,10 +318,10 @@ class ThermometryView(QMainWindow):
         options_group.setLayout(options_layout)
         left_layout.addWidget(options_group)
         
-        # Calculation Button — next step after the four single-file loads
+        # Calculation Button — first baseline frame against first sequence frame
         self.calc_button = QPushButton('Calculate Temperature Change', self)
         self.calc_button.setToolTip(
-            'Two-frame temperature from the four DICOM loads above.'
+            'Two-frame temperature: first baseline frame versus first sequence frame.'
         )
         self.calc_button.clicked.connect(self.on_calculate)
         left_layout.addWidget(self.calc_button)
@@ -332,19 +331,10 @@ class ThermometryView(QMainWindow):
         sequence_group = QGroupBox("Sequence")
         sequence_layout = QVBoxLayout()
         self.sequence_next_label = QLabel(
-            "Next: Load DICOM Sequence, then Generate Cinema."
+            "Next: Load Sequence, then Generate Cinema."
         )
         self.sequence_next_label.setWordWrap(True)
         sequence_layout.addWidget(self.sequence_next_label)
-
-        self.load_sequence_button = QPushButton('Load DICOM Sequence', self)
-        self.load_sequence_button.setToolTip(
-            'Select folders of real / imaginary DICOM frames for Cinema, '
-            'CEM43, and the ROI temperature curve. Same loader as '
-            'Batch → Load Folders.'
-        )
-        self.load_sequence_button.clicked.connect(self.on_batch_load_folders)
-        sequence_layout.addWidget(self.load_sequence_button)
 
         self.cinema_button = QPushButton('Generate Cinema', self)
         self.cinema_button.setToolTip(
@@ -535,28 +525,21 @@ class ThermometryView(QMainWindow):
         self.thermostat_button.clicked.connect(self.generate_thermostat_signal.emit)    # 新增: 生成温度-时间曲线按钮
         
     # UI Event Handlers
-    def on_load_real1(self):
-        file, _ = QFileDialog.getOpenFileName(self, "Select 1st Real DICOM", "", "DICOM Files (*.dcm)")
-        if file:
-            self.load_real1_signal.emit(file)
-            
-    def on_load_imag1(self):
-        file, _ = QFileDialog.getOpenFileName(self, "Select 1st Imaginary DICOM", "", "DICOM Files (*.dcm)")
-        if file:
-            self.load_imag1_signal.emit(file)
-            
-    def on_load_real2(self):
-        file, _ = QFileDialog.getOpenFileName(self, "Select 2nd Real DICOM", "", "DICOM Files (*.dcm)")
-        if file:
-            self.load_real2_signal.emit(file)
-            
-    def on_load_imag2(self):
-        file, _ = QFileDialog.getOpenFileName(self, "Select 2nd Imaginary DICOM", "", "DICOM Files (*.dcm)")
-        if file:
-            self.load_imag2_signal.emit(file)
-            
+    def on_load_baseline(self):
+        """Import the reference series (old first frame)."""
+        self._choose_sequence_import("baseline")
+
+    def on_load_sequence(self):
+        """Import the series to compare or play."""
+        self._choose_sequence_import("sequence")
+
     def on_load_b0_map(self):
-        file, _ = QFileDialog.getOpenFileName(self, "Select B0 Map DICOM", "", "DICOM Files (*.dcm)")
+        file, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select B0 Map DICOM",
+            "",
+            "DICOM (*.dcm *);;All files (*)",
+        )
         if file:
             self.load_b0_map_signal.emit(file)
             self.b0_correction_checkbox.setChecked(True)
@@ -760,7 +743,7 @@ class ThermometryView(QMainWindow):
             )
         elif real_count < 2 or imag_count < 2:
             next_label.setText(
-                "Sequence loaded. Next: Load DICOM Sequence with at least "
+                "Sequence loaded. Next: Load Sequence with at least "
                 "2 real and 2 imaginary frames, then Generate Cinema."
             )
         else:
@@ -807,34 +790,30 @@ class ThermometryView(QMainWindow):
         file_menu = menubar.addMenu('File')
         
         load_menu = file_menu.addMenu('Load')
-        load_real1_action = QAction('Load 1st Real DICOM', self)
-        load_real1_action.triggered.connect(self.on_load_real1)
-        load_imag1_action = QAction('Load 1st Imaginary DICOM', self)
-        load_imag1_action.triggered.connect(self.on_load_imag1)
-        load_real2_action = QAction('Load 2nd Real DICOM', self)
-        load_real2_action.triggered.connect(self.on_load_real2)
-        load_imag2_action = QAction('Load 2nd Imaginary DICOM', self)
-        load_imag2_action.triggered.connect(self.on_load_imag2)
+        load_baseline_action = QAction('Load Baseline Sequence', self)
+        load_baseline_action.triggered.connect(self.on_load_baseline)
+        load_sequence_action = QAction('Load Sequence', self)
+        load_sequence_action.triggered.connect(self.on_load_sequence)
         load_b0_action = QAction('Load B0 Map DICOM', self)
         load_b0_action.triggered.connect(self.on_load_b0_map)
-        load_sequence_action = QAction('Load DICOM Sequence', self)
-        load_sequence_action.triggered.connect(self.on_batch_load_folders)
-        
-        load_menu.addAction(load_real1_action)
-        load_menu.addAction(load_imag1_action)
-        load_menu.addAction(load_real2_action)
-        load_menu.addAction(load_imag2_action)
-        load_menu.addAction(load_b0_action)
-        load_menu.addSeparator()
+
+        load_menu.addAction(load_baseline_action)
         load_menu.addAction(load_sequence_action)
-        
+        load_menu.addAction(load_b0_action)
+
         # 创建独立的Batch菜单
         batch_menu = menubar.addMenu('Batch')
-        load_folders_action = QAction('Load Folders', self)
-        load_folders_action.setToolTip(
-            'Same as Load DICOM Sequence on the main window.'
+        batch_baseline_action = QAction('Load Baseline Sequence', self)
+        batch_baseline_action.setToolTip(
+            'Same as Load Baseline Sequence on the main window.'
         )
-        load_folders_action.triggered.connect(self.on_batch_load_folders)
+        batch_baseline_action.triggered.connect(self.on_load_baseline)
+        batch_menu.addAction(batch_baseline_action)
+        load_folders_action = QAction('Load Sequence', self)
+        load_folders_action.setToolTip(
+            'Same as Load Sequence on the main window.'
+        )
+        load_folders_action.triggered.connect(self.on_load_sequence)
         batch_menu.addAction(load_folders_action)
         
         # 添加Cinema功能
@@ -966,22 +945,34 @@ class ThermometryView(QMainWindow):
             self.load_roi_mask_signal.emit(name)
             
     def on_batch_load_folders(self):
-        """使用自定义对话框批量加载多个文件夹"""
+        """Sequence import.  Kept so older callers still open the same dialog."""
+        self._choose_sequence_import("sequence")
+
+    def _choose_sequence_import(self, role):
+        """Pick files or folders for the baseline or the sequence."""
         if getattr(self, "sequence_busy", False):
             self.show_error(
                 "A temperature sequence is already running. "
                 "Wait for it to finish or cancel it before loading another sequence."
             )
             return
-        dialog = FolderSelectionDialog(self)
+        title = (
+            "Select baseline sequence"
+            if role == "baseline"
+            else "Select sequence"
+        )
+        dialog = FolderSelectionDialog(self, title)
         if dialog.exec_() == QDialog.Accepted:
             selected_folders = dialog.get_selected_folders()
-            
             if selected_folders:
+                self.import_role = role
+                self.import_component_pair = dialog.component_pair()
                 self.batch_load_dicom_signal.emit(selected_folders)
-                self.update_status(f"Scanning {len(selected_folders)} folders for DICOM files...")
+                self.update_status(
+                    f"Scanning {len(selected_folders)} path(s) for DICOM and NIfTI..."
+                )
             else:
-                self.show_error("No folders selected")
+                self.show_error("No folders or files selected")
 
     def on_window_level_changed(self):
         """Handle window/level change for temperature map display."""
@@ -1033,7 +1024,7 @@ class ThermometryView(QMainWindow):
             if not imag_files:
                 missing.append("imag")
             self.show_error(
-                "No sequence data available. Please use 'Load DICOM Sequence' first. "
+                "No sequence data available. Please use 'Load Sequence' first. "
                 "Missing: " + ", ".join(missing) + "."
             )
             return False
@@ -1059,10 +1050,10 @@ class ThermometryView(QMainWindow):
         self.generate_thermostat_signal.emit()
 
 class FolderSelectionDialog(QDialog):
-    """自定义文件夹选择对话框，支持多选文件夹"""
-    def __init__(self, parent=None):
+    """Pick folders and files for one baseline or sequence import."""
+    def __init__(self, parent=None, title="Select sequence"):
         super().__init__(parent)
-        self.setWindowTitle("Select DICOM Folders")
+        self.setWindowTitle(title)
         self.setMinimumWidth(700)
         self.setMinimumHeight(500)
         
@@ -1070,10 +1061,10 @@ class FolderSelectionDialog(QDialog):
         
         # 添加说明标签
         instructions_layout = QVBoxLayout()
-        label1 = QLabel("1. Click 'Add Folder' to add DICOM folders to the list")
-        label2 = QLabel("2. Hold Ctrl key to select multiple folders in the list")
-        label3 = QLabel("3. Click 'OK' to process selected folders")
-        label4 = QLabel("Note: All folders will be scanned recursively for DICOM files")
+        label1 = QLabel("1. Click 'Add Folder' or 'Add Files' (.dcm, extensionless DICOM, .nii, .nii.gz)")
+        label2 = QLabel("2. Hold Ctrl key to select multiple paths in the list")
+        label3 = QLabel("3. Click 'OK' to import the selected paths")
+        label4 = QLabel("Folders are scanned recursively. A missing .dcm suffix is still read.")
         
         # 使说明文本更加突出
         for label in [label1, label2, label3, label4]:
@@ -1084,6 +1075,17 @@ class FolderSelectionDialog(QDialog):
         instructions_layout.addWidget(label3)
         instructions_layout.addWidget(label4)
         layout.addLayout(instructions_layout)
+
+        self.component_combo = QComboBox(self)
+        self.component_combo.addItem("Auto (DICOM tags or filename)", None)
+        self.component_combo.addItem("Real + imaginary", "real_imag")
+        self.component_combo.addItem("Magnitude + phase", "magnitude_phase")
+        self.component_combo.setToolTip(
+            "Used when NIfTI names do not say real/imag or magnitude/phase. "
+            "Two unnamed volumes are sorted by filename: first is real or "
+            "magnitude, second is imaginary or phase."
+        )
+        layout.addWidget(self.component_combo)
         
         # 增加间距
         layout.addSpacing(10)
@@ -1103,9 +1105,13 @@ class FolderSelectionDialog(QDialog):
         add_button = QPushButton("Add Folder")
         add_button.clicked.connect(self.add_folder)
         buttons_layout.addWidget(add_button)
+
+        add_files_button = QPushButton("Add Files")
+        add_files_button.clicked.connect(self.add_files)
+        buttons_layout.addWidget(add_files_button)
         
         # 添加删除文件夹按钮
-        remove_button = QPushButton("Remove Folder")
+        remove_button = QPushButton("Remove")
         remove_button.clicked.connect(self.remove_folder)
         buttons_layout.addWidget(remove_button)
         
@@ -1126,7 +1132,7 @@ class FolderSelectionDialog(QDialog):
         layout.addLayout(folders_layout)
         
         # 状态标签
-        self.status_label = QLabel("Ready to select folders")
+        self.status_label = QLabel("Ready to select folders or files")
         layout.addWidget(self.status_label)
         
         # 确认和取消按钮
@@ -1148,6 +1154,25 @@ class FolderSelectionDialog(QDialog):
                 self.status_label.setText(f"Added folder: {folder}")
                 # 自动选择新添加的文件夹
                 self.folder_list.item(self.folder_list.count() - 1).setSelected(True)
+
+    def add_files(self):
+        """Add DICOM or NIfTI files.  DICOM does not need a .dcm suffix."""
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select DICOM or NIfTI files",
+            "",
+            "Images (*.dcm *.nii *.nii.gz *);;All files (*)",
+        )
+        items = [self.folder_list.item(i).text() for i in range(self.folder_list.count())]
+        added = 0
+        for path in files:
+            if path not in items:
+                self.folder_list.addItem(path)
+                self.folder_list.item(self.folder_list.count() - 1).setSelected(True)
+                items.append(path)
+                added += 1
+        if added:
+            self.status_label.setText(f"Added {added} file(s)")
     
     def remove_folder(self):
         """从列表中删除选定的文件夹"""
@@ -1180,12 +1205,16 @@ class FolderSelectionDialog(QDialog):
         """验证选择并接受对话框"""
         selected_folders = self.get_selected_folders()
         if not selected_folders:
-            self.status_label.setText("Please select at least one folder")
+            self.status_label.setText("Please select at least one folder or file")
             return
             
         self.accept()
+
+    def component_pair(self):
+        """NIfTI pair choice, or None to follow tags and filenames."""
+        return self.component_combo.currentData()
     
     def get_selected_folders(self):
-        """获取所有选择的文件夹"""
+        """获取所有选择的文件夹和文件"""
         return [self.folder_list.item(i).text() for i in range(self.folder_list.count()) 
                 if self.folder_list.item(i).isSelected()]
